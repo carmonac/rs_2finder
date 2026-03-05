@@ -1,0 +1,14 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+*.o
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Test artifacts
+test_dir/

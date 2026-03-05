@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    permissions:
+      contents: write   # needed to create releases and push to main
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT or the default token – push to main requires write access.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Zig ${{ '0.15.0' }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.0   # matches minimum_zig_version in build.zig.zon
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      - name: Build app bundle (ReleaseFast)
+        run: zig build bundle -Doptimize=ReleaseFast
+
+      # ── Package as DMG ─────────────────────────────────────────────────────
+      - name: Create DMG
+        run: |
+          mkdir dmg_staging
+          cp -r "zig-out/R2 Finder.app" dmg_staging/
+          # Symlink so the user can drag straight to Applications
+          ln -s /Applications dmg_staging/Applications
+
+          hdiutil create \
+            -volname "R2 Finder" \
+            -srcfolder dmg_staging \
+            -ov \
+            -format UDZO \
+            "R2.Finder.dmg"
+
+      # ── GitHub Release ─────────────────────────────────────────────────────
+      - name: Create GitHub release and upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            "R2.Finder.dmg#R2 Finder – macOS DMG" \
+            --title "R2 Finder ${{ github.ref_name }}" \
+            --generate-notes
+
+      # ── Update README on main ──────────────────────────────────────────────
+      - name: Update README download link on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          DMG_URL="https://github.com/${REPO}/releases/download/${TAG}/R2.Finder.dmg"
+
+          # Switch to main so the commit lands there, not on the detached tag.
+          git fetch origin main
+          git checkout main
+
+          python3 - "$DMG_URL" "$TAG" <<'PYEOF'
+          import sys, re
+
+          dmg_url, tag = sys.argv[1], sys.argv[2]
+
+          section = f"""\
+          <!-- DOWNLOAD_SECTION_START -->
+          ## Download
+
+          [**R2 Finder {tag} — Descargar DMG**]({dmg_url})
+
+          Arrastra **R2 Finder.app** a tu carpeta `/Applications` desde el DMG.
+
+          Como la aplicación no está notarizada, macOS la pondrá en cuarentena la
+          primera vez. Ejecuta este comando en Terminal **antes** de abrirla:
+
+          ```bash
+          xattr -d com.apple.quarantine /Applications/R2\\ Finder.app
+          ```
+          <!-- DOWNLOAD_SECTION_END -->"""
+
+          # Remove leading spaces added by the heredoc indentation
+          section = '\n'.join(line.lstrip() for line in section.splitlines())
+
+          with open('README.md', 'r') as f:
+              content = f.read()
+
+          pattern = r'<!-- DOWNLOAD_SECTION_START -->.*?<!-- DOWNLOAD_SECTION_END -->'
+          if re.search(pattern, content, re.DOTALL):
+              content = re.sub(pattern, section, content, flags=re.DOTALL)
+          else:
+              content = content.rstrip() + '\n\n' + section + '\n'
+
+          with open('README.md', 'w') as f:
+              f.write(content)
+          PYEOF
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --staged --quiet || \
+            git commit -m "docs: add download link for ${TAG} [skip ci]"
+          git push origin main
