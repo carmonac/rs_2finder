@@ -9,6 +9,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
+const Dir = Io.Dir;
+const File = Io.File;
 
 // ---------------------------------------------------------------------------
 // Global allocator (thread-safe GPA)
@@ -17,7 +20,22 @@ const builtin = @import("builtin");
 var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
 const gpa = gpa_state.allocator();
 
-pub fn init() void {}
+// App-level Io instance backed by a proper threaded implementation.
+// Initialized at runtime in init() because Threaded.init calls sysctlbyname.
+var app_io_instance: Io.Threaded = Io.Threaded.init_single_threaded;
+var app_io_initialized = false;
+
+fn getIo() Io {
+    if (builtin.is_test) return std.testing.io;
+    if (app_io_initialized) return app_io_instance.io();
+    // Fallback before init — shouldn't happen in practice
+    return app_io_instance.ioBasic();
+}
+
+pub fn init() void {
+    app_io_instance = Io.Threaded.init(gpa_state.allocator(), .{});
+    app_io_initialized = true;
+}
 
 export fn zig_init() void {
     init();
@@ -67,6 +85,18 @@ const ZigCompletionCallback = *const fn (
 ) callconv(.c) void;
 
 // ---------------------------------------------------------------------------
+// C interop helpers
+// ---------------------------------------------------------------------------
+
+const c = @cImport({
+    @cInclude("stdlib.h");
+});
+
+fn c_getenv(name: [*:0]const u8) ?[*:0]const u8 {
+    return @ptrCast(c.getenv(name));
+}
+
+// ---------------------------------------------------------------------------
 // zig_list_directory
 // ---------------------------------------------------------------------------
 
@@ -75,9 +105,10 @@ export fn zig_list_directory(path: [*:0]const u8) ?*ZigDirListing {
 }
 
 fn listDirectory(path: [*:0]const u8) !*ZigDirListing {
+    const io = getIo();
     const path_slice = std.mem.sliceTo(path, 0);
-    var dir = try std.fs.openDirAbsolute(path_slice, .{ .iterate = true });
-    defer dir.close();
+    var dir = try Dir.openDirAbsolute(io, path_slice, .{ .iterate = true });
+    defer dir.close(io);
 
     var entries_list = std.array_list.Managed(ZigDirEntry).init(gpa);
     errdefer {
@@ -89,7 +120,7 @@ fn listDirectory(path: [*:0]const u8) !*ZigDirListing {
     }
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         // Build full path
         const full_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ path_slice, entry.name }, 0);
         const name_z = try gpa.dupeZ(u8, entry.name);
@@ -98,11 +129,11 @@ fn listDirectory(path: [*:0]const u8) !*ZigDirListing {
         var mtime: i64 = 0;
         var is_symlink = false;
 
-        if (std.fs.openFileAbsolute(full_path, .{})) |f| {
-            defer f.close();
-            if (f.stat()) |st| {
+        if (Dir.openFileAbsolute(io, full_path, .{})) |f| {
+            defer f.close(io);
+            if (f.stat(io)) |st| {
                 size = st.size;
-                mtime = @intCast(@divTrunc(st.mtime, std.time.ns_per_s));
+                mtime = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
             } else |_| {}
         } else |_| {}
 
@@ -135,11 +166,12 @@ fn listDirectory(path: [*:0]const u8) !*ZigDirListing {
 }
 
 fn isSymlinkDir(path: [*:0]const u8) bool {
+    const io = getIo();
     const path_slice = std.mem.sliceTo(path, 0);
-    const real = std.fs.realpathAlloc(gpa, path_slice) catch return false;
-    defer gpa.free(real);
-    var d = std.fs.openDirAbsolute(real, .{}) catch return false;
-    d.close();
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = Dir.realPathFileAbsolute(io, path_slice, &buf) catch return false;
+    var d = Dir.openDirAbsolute(io, buf[0..len], .{}) catch return false;
+    d.close(io);
     return true;
 }
 
@@ -162,16 +194,17 @@ export fn zig_get_volumes() ?*ZigVolumeList {
 }
 
 fn getVolumes() !*ZigVolumeList {
+    const io = getIo();
     var list = std.array_list.Managed(ZigVolume).init(gpa);
     errdefer list.deinit();
 
-    var vols_dir = std.fs.openDirAbsolute("/Volumes", .{ .iterate = true }) catch {
+    var vols_dir = Dir.openDirAbsolute(io, "/Volumes", .{ .iterate = true }) catch {
         return makeEmptyVolumeList();
     };
-    defer vols_dir.close();
+    defer vols_dir.close(io);
 
     var it = vols_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.name[0] == '.') continue;
         const path = try std.fmt.allocPrintSentinel(gpa, "/Volumes/{s}", .{entry.name}, 0);
         const name = try gpa.dupeZ(u8, entry.name);
@@ -202,7 +235,9 @@ export fn zig_get_special_dirs() ?*ZigVolumeList {
 }
 
 fn getSpecialDirs() !*ZigVolumeList {
-    const home = std.posix.getenv("HOME") orelse "/";
+    const io = getIo();
+    const home_ptr = c_getenv("HOME") orelse return makeEmptyVolumeList();
+    const home = std.mem.sliceTo(home_ptr, 0);
     var list = std.array_list.Managed(ZigVolume).init(gpa);
     errdefer list.deinit();
 
@@ -223,11 +258,11 @@ fn getSpecialDirs() !*ZigVolumeList {
         else
             try std.fmt.allocPrintSentinel(gpa, "{s}{s}", .{ home, d.rel }, 0);
         // Only add if the directory actually exists
-        var dir = std.fs.openDirAbsolute(std.mem.sliceTo(full, 0), .{}) catch {
+        var dir = Dir.openDirAbsolute(io, std.mem.sliceTo(full, 0), .{}) catch {
             gpa.free(full);
             continue;
         };
-        dir.close();
+        dir.close(io);
         const name = try gpa.dupeZ(u8, d.name);
         try list.append(.{ .name = name, .path = full });
     }
@@ -254,13 +289,14 @@ export fn zig_check_collision(
     src_count: u64,
     dst_dir: [*:0]const u8,
 ) bool {
+    const io = getIo();
     const dst = std.mem.sliceTo(dst_dir, 0);
     for (src_paths[0..src_count]) |sp| {
         const src = std.mem.sliceTo(sp, 0);
         const basename = std.fs.path.basename(src);
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [Dir.max_path_bytes]u8 = undefined;
         const candidate = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dst, basename }) catch continue;
-        std.fs.accessAbsolute(std.mem.sliceTo(candidate, 0), .{}) catch continue;
+        Dir.accessAbsolute(io, std.mem.sliceTo(candidate, 0), .{}) catch continue;
         return true; // exists
     }
     return false;
@@ -320,7 +356,6 @@ fn spawnTransfer(
     };
     for (src_paths[0..src_count], 0..) |p, i| {
         paths[i] = gpa.dupeZ(u8, std.mem.sliceTo(p, 0)) catch {
-            // free already-allocated paths
             for (paths[0..i]) |prev| gpa.free(prev);
             gpa.free(paths);
             on_done(ctx, false, "sin memoria");
@@ -363,8 +398,6 @@ fn freeJob(job: *TransferJob) void {
     gpa.destroy(job);
 }
 
-// Rsync progress2 output line example:
-//         32,768  50%   31.25kB/s    0:00:00 (xfr#1, to-chk=0/1)
 fn transferThread(job: *TransferJob) void {
     defer freeJob(job);
     runTransfer(job) catch |err| {
@@ -375,6 +408,7 @@ fn transferThread(job: *TransferJob) void {
 }
 
 fn runTransfer(job: *TransferJob) !void {
+    const io = getIo();
     const raw_dst = std.mem.sliceTo(job.dst_dir, 0);
 
     // Destination needs a trailing slash: rsync copies sources *into* the dir.
@@ -396,46 +430,45 @@ fn runTransfer(job: *TransferJob) !void {
     for (job.src_paths) |p| try argv.append(std.mem.sliceTo(p, 0));
     try argv.append(std.mem.sliceTo(dst_with_slash, 0));
 
-    var child = std.process.Child.init(argv.items, gpa);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
 
     // Drain stdout and stderr in parallel threads so neither pipe ever fills
     // and deadlocks rsync.
     const DrainCtx = struct {
-        file: std.fs.File,
+        file: File,
+        io_handle: Io,
         buf: [8192]u8 = undefined,
         len: usize = 0,
         fn run(ctx: *@This()) void {
+            var read_buf: [4096]u8 = undefined;
             while (true) {
+                const n = ctx.file.readStreaming(ctx.io_handle, &.{&read_buf}) catch break;
+                if (n == 0) break;
                 const space = ctx.buf.len - 1 - ctx.len;
-                if (space == 0) {
-                    // Buffer full – just discard further output by reading into
-                    // a scratch buffer so rsync keeps running.
-                    var scratch: [4096]u8 = undefined;
-                    const n = ctx.file.read(&scratch) catch break;
-                    if (n == 0) break;
-                } else {
-                    const n = ctx.file.read(ctx.buf[ctx.len .. ctx.len + space]) catch break;
-                    if (n == 0) break;
-                    ctx.len += n;
+                if (space > 0) {
+                    const copy_len = @min(n, space);
+                    @memcpy(ctx.buf[ctx.len .. ctx.len + copy_len], read_buf[0..copy_len]);
+                    ctx.len += copy_len;
                 }
             }
         }
     };
 
-    var stdoutCtx = DrainCtx{ .file = child.stdout.? };
-    var stderrCtx = DrainCtx{ .file = child.stderr.? };
+    var stdoutCtx = DrainCtx{ .file = child.stdout.?, .io_handle = io };
+    var stderrCtx = DrainCtx{ .file = child.stderr.?, .io_handle = io };
     const stdoutThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stdoutCtx});
     const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
 
     stdoutThread.join();
     stderrThread.join();
 
-    const term = try child.wait();
+    const term = try child.wait(io);
     const exit_code: u8 = switch (term) {
-        .Exited => |c| c,
+        .exited => |c2| c2,
         else => 255,
     };
     const success = exit_code == 0;
@@ -456,9 +489,12 @@ fn runTransfer(job: *TransferJob) !void {
     if (job.is_move) {
         for (job.src_paths) |p| {
             const src = std.mem.sliceTo(p, 0);
-            var rm_args = [_][]const u8{ "/bin/rm", "-rf", src };
-            var rmc = std.process.Child.init(&rm_args, gpa);
-            _ = rmc.spawnAndWait() catch {};
+            var rmc = try std.process.spawn(io, .{
+                .argv = &.{ "/bin/rm", "-rf", src },
+                .stdout = .ignore,
+                .stderr = .ignore,
+            });
+            _ = rmc.wait(io) catch {};
         }
     }
 
@@ -475,48 +511,30 @@ export fn zig_delete_files(
     err_buf: [*]u8,
     err_buf_len: u64,
 ) bool {
+    const io = getIo();
     for (paths[0..count]) |p| {
         const path_slice = std.mem.sliceTo(p, 0);
-        // Try removing via trash first (using AppleScript)
-        if (!trashViaApplescript(path_slice)) {
-            // Fallback: rm -rf
-            var argv = [_][]const u8{ "rm", "-rf", path_slice };
-            var child = std.process.Child.init(&argv, gpa);
-            const term = child.spawnAndWait() catch {
-                _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "no se pudo eliminar: {s}", .{path_slice}) catch {};
+        var child = std.process.spawn(io, .{
+            .argv = &.{ "/bin/rm", "-rf", path_slice },
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch {
+            _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "no se pudo eliminar: {s}", .{path_slice}) catch {};
+            return false;
+        };
+        const term = child.wait(io) catch {
+            _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "no se pudo eliminar: {s}", .{path_slice}) catch {};
+            return false;
+        };
+        switch (term) {
+            .exited => |code| if (code != 0) {
+                _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "rm falló en: {s}", .{path_slice}) catch {};
                 return false;
-            };
-            switch (term) {
-                .Exited => |code| if (code != 0) {
-                    _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "rm falló en: {s}", .{path_slice}) catch {};
-                    return false;
-                },
-                else => return false,
-            }
+            },
+            else => return false,
         }
     }
     return true;
-}
-
-fn trashViaApplescript(path: []const u8) bool {
-    var buf: [1024]u8 = undefined;
-    const script = std.fmt.bufPrint(&buf,
-        \\tell application "Finder" to delete POSIX file "{s}"
-    , .{path}) catch return false;
-    var argv = [_][]const u8{ "osascript", "-e", script };
-    var child = std.process.Child.init(&argv, gpa);
-    // Do NOT inherit the caller's stdin/stdout/stderr.  If osascript blocks
-    // (e.g. waiting for a macOS Automation permission dialog) while the
-    // caller's stdout is a pipe, the pipe would never reach EOF and the
-    // reader (zig build / any test harness) would deadlock.
-    child.stdin_behavior = .Close;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    const term = child.spawnAndWait() catch return false;
-    return switch (term) {
-        .Exited => |c| c == 0,
-        else => false,
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -524,7 +542,8 @@ fn trashViaApplescript(path: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 export fn zig_create_directory(path: [*:0]const u8, err_buf: [*]u8, err_buf_len: u64) bool {
-    std.fs.makeDirAbsolute(std.mem.sliceTo(path, 0)) catch |err| {
+    const io = getIo();
+    Dir.createDirAbsolute(io,std.mem.sliceTo(path, 0), File.Permissions.default_dir) catch |err| {
         _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "error: {}", .{err}) catch {};
         return false;
     };
@@ -536,11 +555,234 @@ export fn zig_create_directory(path: [*:0]const u8, err_buf: [*]u8, err_buf_len:
 // ---------------------------------------------------------------------------
 
 export fn zig_rename(src: [*:0]const u8, dst: [*:0]const u8, err_buf: [*]u8, err_buf_len: u64) bool {
-    std.fs.renameAbsolute(std.mem.sliceTo(src, 0), std.mem.sliceTo(dst, 0)) catch |err| {
+    const io = getIo();
+    Dir.renameAbsolute(std.mem.sliceTo(src, 0), std.mem.sliceTo(dst, 0), io) catch |err| {
         _ = std.fmt.bufPrint(err_buf[0..err_buf_len], "error: {}", .{err}) catch {};
         return false;
     };
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Compress / Uncompress  (async, 7zz-based)
+// ---------------------------------------------------------------------------
+
+const ArchiveJob = struct {
+    sevenzz_path: [:0]u8,
+    src_paths: ?[][:0]u8, // null for uncompress
+    archive_path: [:0]u8, // dst archive (compress) or src archive (uncompress)
+    dst_dir: ?[:0]u8, // only for uncompress
+    is_compress: bool,
+    ctx: ?*anyopaque,
+    on_progress: ZigProgressCallback,
+    on_done: ZigCompletionCallback,
+};
+
+export fn zig_compress(
+    sevenzz_path: [*:0]const u8,
+    src_paths: [*]const [*:0]const u8,
+    src_count: u64,
+    dst_archive: [*:0]const u8,
+    ctx: ?*anyopaque,
+    on_progress: ZigProgressCallback,
+    on_done: ZigCompletionCallback,
+) void {
+    var paths = gpa.alloc([:0]u8, src_count) catch {
+        on_done(ctx, false, "sin memoria");
+        return;
+    };
+    for (src_paths[0..src_count], 0..) |p, i| {
+        paths[i] = gpa.dupeZ(u8, std.mem.sliceTo(p, 0)) catch {
+            for (paths[0..i]) |prev| gpa.free(prev);
+            gpa.free(paths);
+            on_done(ctx, false, "sin memoria");
+            return;
+        };
+    }
+    const job = gpa.create(ArchiveJob) catch {
+        for (paths) |p| gpa.free(p);
+        gpa.free(paths);
+        on_done(ctx, false, "sin memoria");
+        return;
+    };
+    job.* = .{
+        .sevenzz_path = gpa.dupeZ(u8, std.mem.sliceTo(sevenzz_path, 0)) catch {
+            for (paths) |p| gpa.free(p);
+            gpa.free(paths);
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
+        .src_paths = paths,
+        .archive_path = gpa.dupeZ(u8, std.mem.sliceTo(dst_archive, 0)) catch {
+            for (paths) |p| gpa.free(p);
+            gpa.free(paths);
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
+        .dst_dir = null,
+        .is_compress = true,
+        .ctx = ctx,
+        .on_progress = on_progress,
+        .on_done = on_done,
+    };
+    const thread = std.Thread.spawn(.{}, archiveThread, .{job}) catch {
+        freeArchiveJob(job);
+        on_done(ctx, false, "no se pudo crear hilo");
+        return;
+    };
+    thread.detach();
+}
+
+export fn zig_uncompress(
+    sevenzz_path: [*:0]const u8,
+    archive_path: [*:0]const u8,
+    dst_dir: [*:0]const u8,
+    ctx: ?*anyopaque,
+    on_progress: ZigProgressCallback,
+    on_done: ZigCompletionCallback,
+) void {
+    const job = gpa.create(ArchiveJob) catch {
+        on_done(ctx, false, "sin memoria");
+        return;
+    };
+    job.* = .{
+        .sevenzz_path = gpa.dupeZ(u8, std.mem.sliceTo(sevenzz_path, 0)) catch {
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
+        .src_paths = null,
+        .archive_path = gpa.dupeZ(u8, std.mem.sliceTo(archive_path, 0)) catch {
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
+        .dst_dir = gpa.dupeZ(u8, std.mem.sliceTo(dst_dir, 0)) catch {
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
+        .is_compress = false,
+        .ctx = ctx,
+        .on_progress = on_progress,
+        .on_done = on_done,
+    };
+    const thread = std.Thread.spawn(.{}, archiveThread, .{job}) catch {
+        freeArchiveJob(job);
+        on_done(ctx, false, "no se pudo crear hilo");
+        return;
+    };
+    thread.detach();
+}
+
+fn freeArchiveJob(job: *ArchiveJob) void {
+    if (job.src_paths) |paths| {
+        for (paths) |p| gpa.free(p);
+        gpa.free(paths);
+    }
+    gpa.free(job.sevenzz_path);
+    gpa.free(job.archive_path);
+    if (job.dst_dir) |d| gpa.free(d);
+    gpa.destroy(job);
+}
+
+fn archiveThread(job: *ArchiveJob) void {
+    defer freeArchiveJob(job);
+    runArchive(job) catch |err| {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&buf, "Error: {}", .{err}) catch "error desconocido";
+        job.on_done(job.ctx, false, msg.ptr);
+    };
+}
+
+fn runArchive(job: *ArchiveJob) !void {
+    const io = getIo();
+    var argv = std.array_list.Managed([]const u8).init(gpa);
+    defer argv.deinit();
+
+    try argv.append(std.mem.sliceTo(job.sevenzz_path, 0));
+
+    if (job.is_compress) {
+        try argv.append("a");
+        try argv.append("-y");
+        try argv.append(std.mem.sliceTo(job.archive_path, 0));
+        if (job.src_paths) |paths| {
+            for (paths) |p| try argv.append(std.mem.sliceTo(p, 0));
+        }
+    } else {
+        try argv.append("x");
+        try argv.append("-y");
+        try argv.append(std.mem.sliceTo(job.archive_path, 0));
+    }
+
+    // Build -o flag outside the if/else so its lifetime covers spawn+wait
+    var out_flag: ?[]u8 = null;
+    defer if (out_flag) |f| gpa.free(f);
+    if (!job.is_compress) {
+        out_flag = try std.fmt.allocPrint(gpa, "-o{s}", .{
+            std.mem.sliceTo(job.dst_dir.?, 0),
+        });
+        // Insert -o flag before the archive path (which is the last element)
+        const archive_path = argv.pop().?;
+        try argv.append(out_flag.?);
+        try argv.append(archive_path);
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+
+    const DrainCtx = struct {
+        file: File,
+        io_handle: Io,
+        buf: [8192]u8 = undefined,
+        len: usize = 0,
+        fn run(ctx: *@This()) void {
+            var read_buf: [4096]u8 = undefined;
+            while (true) {
+                const n = ctx.file.readStreaming(ctx.io_handle, &.{&read_buf}) catch break;
+                if (n == 0) break;
+                const space = ctx.buf.len - 1 - ctx.len;
+                if (space > 0) {
+                    const copy_len = @min(n, space);
+                    @memcpy(ctx.buf[ctx.len .. ctx.len + copy_len], read_buf[0..copy_len]);
+                    ctx.len += copy_len;
+                }
+            }
+        }
+    };
+
+    var stdoutCtx = DrainCtx{ .file = child.stdout.?, .io_handle = io };
+    var stderrCtx = DrainCtx{ .file = child.stderr.?, .io_handle = io };
+    const stdoutThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stdoutCtx});
+    const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
+
+    stdoutThread.join();
+    stderrThread.join();
+
+    const term = try child.wait(io);
+    const exit_code: u8 = switch (term) {
+        .exited => |c2| c2,
+        else => 255,
+    };
+    const success = exit_code == 0;
+
+    if (!success) {
+        const se = std.mem.trim(u8, stderrCtx.buf[0..stderrCtx.len], " \t\r\n");
+        var eb: [512]u8 = undefined;
+        const msg = if (se.len > 0)
+            std.fmt.bufPrintZ(&eb, "7zz: {s}", .{se}) catch "7zz falló"
+        else
+            std.fmt.bufPrintZ(&eb, "7zz salió con código {d}", .{exit_code}) catch "7zz falló";
+        job.on_done(job.ctx, false, msg.ptr);
+        return;
+    }
+
+    job.on_done(job.ctx, true, null);
 }
 
 // ===========================================================================
@@ -551,60 +793,67 @@ export fn zig_rename(src: [*:0]const u8, dst: [*:0]const u8, err_buf: [*]u8, err
 
 /// Callback context used by the async copy/move tests.
 const DoneCtx = struct {
-    mu: std.Thread.Mutex = .{},
-    cv: std.Thread.Condition = .{},
-    done: bool = false,
-    success: bool = false,
+    done: std.atomic.Value(bool) = .init(false),
+    success: std.atomic.Value(bool) = .init(false),
 
     fn onProgress(_: ?*anyopaque, _: f64, _: u64, _: u64, _: f64, _: i64) callconv(.c) void {}
 
     fn onDone(raw: ?*anyopaque, ok: bool, _: ?[*:0]const u8) callconv(.c) void {
         const self: *DoneCtx = @ptrCast(@alignCast(raw.?));
-        self.mu.lock();
-        defer self.mu.unlock();
-        self.success = ok;
-        self.done = true;
-        self.cv.signal();
+        self.success.store(ok, .release);
+        self.done.store(true, .release);
     }
 
     fn wait(self: *DoneCtx) bool {
-        self.mu.lock();
-        defer self.mu.unlock();
-        while (!self.done) self.cv.wait(&self.mu);
-        return self.success;
+        while (!self.done.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+        return self.success.load(.acquire);
     }
 };
+
+fn testBasePath() ![]const u8 {
+    const tio = getIo();
+    const cwd = try std.process.currentPathAlloc(tio, gpa);
+    defer gpa.free(cwd);
+    const result = try gpa.alloc(u8, cwd.len + "/test_dir".len);
+    @memcpy(result[0..cwd.len], cwd);
+    @memcpy(result[cwd.len..], "/test_dir");
+    return result;
+}
 
 // ---------------------------------------------------------------------------
 // zig_create_directory
 // ---------------------------------------------------------------------------
 
 test "zig_create_directory creates a new directory" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var pb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var pb: [Dir.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&pb, "{s}/create_test", .{base});
-    std.fs.deleteTreeAbsolute(path) catch {};
+    Dir.deleteTree(.cwd(), io, path) catch {};
 
     var err_buf: [256]u8 = undefined;
     try std.testing.expect(zig_create_directory(path.ptr, &err_buf, err_buf.len));
 
-    var d = try std.fs.openDirAbsolute(path, .{});
-    d.close();
+    var d = try Dir.openDirAbsolute(io, path, .{});
+    d.close(io);
 
-    try std.fs.deleteTreeAbsolute(path);
+    Dir.deleteTree(.cwd(), io, path) catch {};
 }
 
 test "zig_create_directory fails on existing path" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var pb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var pb: [Dir.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&pb, "{s}/create_exists", .{base});
-    std.fs.deleteTreeAbsolute(path) catch {};
-    try std.fs.makeDirAbsolute(path);
-    defer std.fs.deleteTreeAbsolute(path) catch {};
+    Dir.deleteTree(.cwd(), io, path) catch {};
+    Dir.createDirAbsolute(io,path, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, path) catch {};
 
     var err_buf: [256]u8 = undefined;
     try std.testing.expect(!zig_create_directory(path.ptr, &err_buf, err_buf.len));
@@ -615,26 +864,27 @@ test "zig_create_directory fails on existing path" {
 // ---------------------------------------------------------------------------
 
 test "zig_rename renames a file" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var sb: [std.fs.max_path_bytes + 1]u8 = undefined;
-    var db: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var sb: [Dir.max_path_bytes + 1]u8 = undefined;
+    var db: [Dir.max_path_bytes + 1]u8 = undefined;
     const src = try std.fmt.bufPrintZ(&sb, "{s}/rename_src.txt", .{base});
     const dst = try std.fmt.bufPrintZ(&db, "{s}/rename_dst.txt", .{base});
-    std.fs.deleteFileAbsolute(src) catch {};
-    std.fs.deleteFileAbsolute(dst) catch {};
+    Dir.deleteFileAbsolute(io, src) catch {};
+    Dir.deleteFileAbsolute(io, dst) catch {};
 
-    const fh = try std.fs.createFileAbsolute(src, .{});
-    fh.close();
+    const fh = try Dir.createFileAbsolute(io, src, .{});
+    fh.close(io);
 
     var err_buf: [256]u8 = undefined;
     try std.testing.expect(zig_rename(src.ptr, dst.ptr, &err_buf, err_buf.len));
 
     // src must be gone, dst must exist
-    if (std.fs.accessAbsolute(src, .{})) |_| return error.SrcStillExists else |_| {}
-    try std.fs.accessAbsolute(dst, .{});
-    std.fs.deleteFileAbsolute(dst) catch {};
+    if (Dir.accessAbsolute(io, src, .{})) |_| return error.SrcStillExists else |_| {}
+    try Dir.accessAbsolute(io, dst, .{});
+    Dir.deleteFileAbsolute(io, dst) catch {};
 }
 
 // ---------------------------------------------------------------------------
@@ -642,25 +892,26 @@ test "zig_rename renames a file" {
 // ---------------------------------------------------------------------------
 
 test "zig_list_directory lists entries, dirs first" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var lb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var lb: [Dir.max_path_bytes + 1]u8 = undefined;
     const list_path = try std.fmt.bufPrintZ(&lb, "{s}/list_test", .{base});
-    std.fs.deleteTreeAbsolute(list_path) catch {};
-    try std.fs.makeDirAbsolute(list_path);
-    defer std.fs.deleteTreeAbsolute(list_path) catch {};
+    Dir.deleteTree(.cwd(), io, list_path) catch {};
+    Dir.createDirAbsolute(io,list_path, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, list_path) catch {};
 
     // create file.txt then subdir/
     const file_path = try std.fmt.allocPrintSentinel(gpa, "{s}/file.txt", .{list_path}, 0);
     defer gpa.free(file_path);
-    const f = try std.fs.createFileAbsolute(file_path, .{});
-    try f.writeAll("hello");
-    f.close();
+    const f = try Dir.createFileAbsolute(io, file_path, .{});
+    f.writeStreamingAll(io, "hello") catch {};
+    f.close(io);
 
     const sub_path = try std.fmt.allocPrintSentinel(gpa, "{s}/subdir", .{list_path}, 0);
     defer gpa.free(sub_path);
-    try std.fs.makeDirAbsolute(sub_path);
+    Dir.createDirAbsolute(io,sub_path, File.Permissions.default_dir) catch {};
 
     const listing = zig_list_directory(list_path.ptr);
     try std.testing.expect(listing != null);
@@ -684,29 +935,30 @@ test "zig_list_directory returns null for non-existent path" {
 // ---------------------------------------------------------------------------
 
 test "zig_check_collision detects name clash" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var db: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var db: [Dir.max_path_bytes + 1]u8 = undefined;
     const dst = try std.fmt.bufPrintZ(&db, "{s}/collision_dst", .{base});
-    std.fs.deleteTreeAbsolute(dst) catch {};
-    try std.fs.makeDirAbsolute(dst);
-    defer std.fs.deleteTreeAbsolute(dst) catch {};
+    Dir.deleteTree(.cwd(), io, dst) catch {};
+    Dir.createDirAbsolute(io,dst, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, dst) catch {};
 
     // place clash.txt inside dst
     const clash = try std.fmt.allocPrintSentinel(gpa, "{s}/clash.txt", .{dst}, 0);
     defer gpa.free(clash);
-    const fh = try std.fs.createFileAbsolute(clash, .{});
-    fh.close();
+    const fh = try Dir.createFileAbsolute(io, clash, .{});
+    fh.close(io);
 
     // src has same basename → should collide
-    var src1b: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var src1b: [Dir.max_path_bytes + 1]u8 = undefined;
     const src1 = try std.fmt.bufPrintZ(&src1b, "/tmp/clash.txt", .{});
     const ptrs1 = [_][*:0]const u8{src1.ptr};
     try std.testing.expect(zig_check_collision(&ptrs1, 1, dst.ptr));
 
     // src with different basename → no collision
-    var src2b: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var src2b: [Dir.max_path_bytes + 1]u8 = undefined;
     const src2 = try std.fmt.bufPrintZ(&src2b, "/tmp/unique_xyz_rs2finder.txt", .{});
     const ptrs2 = [_][*:0]const u8{src2.ptr};
     try std.testing.expect(!zig_check_collision(&ptrs2, 1, dst.ptr));
@@ -738,25 +990,26 @@ test "zig_get_special_dirs includes home directory" {
 // ---------------------------------------------------------------------------
 
 test "zig_copy_files copies file to destination" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var srcb: [std.fs.max_path_bytes + 1]u8 = undefined;
-    var dstb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var srcb: [Dir.max_path_bytes + 1]u8 = undefined;
+    var dstb: [Dir.max_path_bytes + 1]u8 = undefined;
     const src_dir = try std.fmt.bufPrintZ(&srcb, "{s}/copy_src", .{base});
     const dst_dir = try std.fmt.bufPrintZ(&dstb, "{s}/copy_dst", .{base});
-    std.fs.deleteTreeAbsolute(src_dir) catch {};
-    std.fs.deleteTreeAbsolute(dst_dir) catch {};
-    try std.fs.makeDirAbsolute(src_dir);
-    try std.fs.makeDirAbsolute(dst_dir);
-    defer std.fs.deleteTreeAbsolute(src_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(dst_dir) catch {};
+    Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    Dir.deleteTree(.cwd(), io, dst_dir) catch {};
+    Dir.createDirAbsolute(io,src_dir, File.Permissions.default_dir) catch {};
+    Dir.createDirAbsolute(io,dst_dir, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, dst_dir) catch {};
 
     const src_file = try std.fmt.allocPrintSentinel(gpa, "{s}/hello.txt", .{src_dir}, 0);
     defer gpa.free(src_file);
-    const fh = try std.fs.createFileAbsolute(src_file, .{});
-    try fh.writeAll("hello from rs_2finder\n");
-    fh.close();
+    const fh = try Dir.createFileAbsolute(io, src_file, .{});
+    fh.writeStreamingAll(io, "hello from rs_2finder\n") catch {};
+    fh.close(io);
 
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
@@ -766,25 +1019,26 @@ test "zig_copy_files copies file to destination" {
     // dst has the copy
     const dst_file = try std.fmt.allocPrintSentinel(gpa, "{s}/hello.txt", .{dst_dir}, 0);
     defer gpa.free(dst_file);
-    try std.fs.accessAbsolute(dst_file, .{});
+    try Dir.accessAbsolute(io, dst_file, .{});
     // original still present
-    try std.fs.accessAbsolute(src_file, .{});
+    try Dir.accessAbsolute(io, src_file, .{});
 }
 
 test "zig_copy_files respects overwrite=false" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var srcb: [std.fs.max_path_bytes + 1]u8 = undefined;
-    var dstb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var srcb: [Dir.max_path_bytes + 1]u8 = undefined;
+    var dstb: [Dir.max_path_bytes + 1]u8 = undefined;
     const src_dir = try std.fmt.bufPrintZ(&srcb, "{s}/copy_noow_src", .{base});
     const dst_dir = try std.fmt.bufPrintZ(&dstb, "{s}/copy_noow_dst", .{base});
-    std.fs.deleteTreeAbsolute(src_dir) catch {};
-    std.fs.deleteTreeAbsolute(dst_dir) catch {};
-    try std.fs.makeDirAbsolute(src_dir);
-    try std.fs.makeDirAbsolute(dst_dir);
-    defer std.fs.deleteTreeAbsolute(src_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(dst_dir) catch {};
+    Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    Dir.deleteTree(.cwd(), io, dst_dir) catch {};
+    Dir.createDirAbsolute(io,src_dir, File.Permissions.default_dir) catch {};
+    Dir.createDirAbsolute(io,dst_dir, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, dst_dir) catch {};
 
     const src_file = try std.fmt.allocPrintSentinel(gpa, "{s}/data.txt", .{src_dir}, 0);
     defer gpa.free(src_file);
@@ -792,14 +1046,14 @@ test "zig_copy_files respects overwrite=false" {
     defer gpa.free(dst_file);
 
     // write "original" to dst first
-    const pre = try std.fs.createFileAbsolute(dst_file, .{});
-    try pre.writeAll("original");
-    pre.close();
+    const pre = try Dir.createFileAbsolute(io, dst_file, .{});
+    pre.writeStreamingAll(io, "original") catch {};
+    pre.close(io);
 
     // write "new" to src
-    const sf = try std.fs.createFileAbsolute(src_file, .{});
-    try sf.writeAll("new");
-    sf.close();
+    const sf = try Dir.createFileAbsolute(io, src_file, .{});
+    sf.writeStreamingAll(io, "new") catch {};
+    sf.close(io);
 
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
@@ -808,10 +1062,10 @@ test "zig_copy_files respects overwrite=false" {
     try std.testing.expect(ctx.wait());
 
     // dst content should still be "original"
-    const df = try std.fs.openFileAbsolute(dst_file, .{});
-    defer df.close();
+    const df = try Dir.openFileAbsolute(io, dst_file, .{});
+    defer df.close(io);
     var content: [64]u8 = undefined;
-    const n = try df.readAll(&content);
+    const n = df.readStreaming(io, &.{&content}) catch 0;
     try std.testing.expectEqualStrings("original", content[0..n]);
 }
 
@@ -820,25 +1074,26 @@ test "zig_copy_files respects overwrite=false" {
 // ---------------------------------------------------------------------------
 
 test "zig_move_files moves file, removes source" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    var srcb: [std.fs.max_path_bytes + 1]u8 = undefined;
-    var dstb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    var srcb: [Dir.max_path_bytes + 1]u8 = undefined;
+    var dstb: [Dir.max_path_bytes + 1]u8 = undefined;
     const src_dir = try std.fmt.bufPrintZ(&srcb, "{s}/move_src", .{base});
     const dst_dir = try std.fmt.bufPrintZ(&dstb, "{s}/move_dst", .{base});
-    std.fs.deleteTreeAbsolute(src_dir) catch {};
-    std.fs.deleteTreeAbsolute(dst_dir) catch {};
-    try std.fs.makeDirAbsolute(src_dir);
-    try std.fs.makeDirAbsolute(dst_dir);
-    defer std.fs.deleteTreeAbsolute(src_dir) catch {};
-    defer std.fs.deleteTreeAbsolute(dst_dir) catch {};
+    Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    Dir.deleteTree(.cwd(), io, dst_dir) catch {};
+    Dir.createDirAbsolute(io,src_dir, File.Permissions.default_dir) catch {};
+    Dir.createDirAbsolute(io,dst_dir, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, src_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, dst_dir) catch {};
 
     const src_file = try std.fmt.allocPrintSentinel(gpa, "{s}/move_me.txt", .{src_dir}, 0);
     defer gpa.free(src_file);
-    const fh = try std.fs.createFileAbsolute(src_file, .{});
-    try fh.writeAll("move me\n");
-    fh.close();
+    const fh = try Dir.createFileAbsolute(io, src_file, .{});
+    fh.writeStreamingAll(io, "move me\n") catch {};
+    fh.close(io);
 
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
@@ -848,9 +1103,9 @@ test "zig_move_files moves file, removes source" {
     // dst has the file
     const dst_file = try std.fmt.allocPrintSentinel(gpa, "{s}/move_me.txt", .{dst_dir}, 0);
     defer gpa.free(dst_file);
-    try std.fs.accessAbsolute(dst_file, .{});
+    try Dir.accessAbsolute(io, dst_file, .{});
     // src file is gone
-    if (std.fs.accessAbsolute(src_file, .{})) |_| return error.SrcFileStillExists else |_| {}
+    if (Dir.accessAbsolute(io, src_file, .{})) |_| return error.SrcFileStillExists else |_| {}
 }
 
 // ---------------------------------------------------------------------------
@@ -858,46 +1113,82 @@ test "zig_move_files moves file, removes source" {
 // ---------------------------------------------------------------------------
 
 test "zig_delete_files removes a file" {
-    var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try std.fs.cwd().realpath("test_dir", &rb);
-    var pb: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
+    var pb: [Dir.max_path_bytes + 1]u8 = undefined;
     const del_file = try std.fmt.bufPrintZ(&pb, "{s}/delete_me.txt", .{base});
 
-    const fh = try std.fs.createFileAbsolute(del_file, .{});
-    fh.close();
+    const fh = try Dir.createFileAbsolute(io, del_file, .{});
+    fh.close(io);
 
-    // zig_delete_files calls osascript to move the file to Trash. On first
-    // run with a new binary path macOS shows an Automation permission dialog
-    // for Finder, which blocks osascript indefinitely until the user clicks
-    // Allow.  Run the call in a thread and bail out after 8 s so the suite
-    // never hangs.  Once the permission is granted (System Settings →
-    // Privacy & Security → Automation → Finder) the test completes normally.
-    var done = std.atomic.Value(bool).init(false);
-    var ok_val = std.atomic.Value(bool).init(false);
+    var err_buf: [256]u8 = undefined;
+    const ptrs = [_][*:0]const u8{del_file.ptr};
+    try std.testing.expect(zig_delete_files(&ptrs, 1, &err_buf, err_buf.len));
+    if (Dir.accessAbsolute(io, del_file, .{})) |_| return error.FileStillExists else |_| {}
+}
 
-    const thread = try std.Thread.spawn(.{}, struct {
-        fn f(path: [:0]const u8, d: *std.atomic.Value(bool), r: *std.atomic.Value(bool)) void {
-            var err_buf: [256]u8 = undefined;
-            const ptrs = [_][*:0]const u8{path.ptr};
-            r.store(zig_delete_files(&ptrs, 1, &err_buf, err_buf.len), .release);
-            d.store(true, .release);
-        }
-    }.f, .{ del_file, &done, &ok_val });
-    thread.detach();
+// ---------------------------------------------------------------------------
+// zig_compress + zig_uncompress
+// ---------------------------------------------------------------------------
 
-    const deadline = std.time.nanoTimestamp() + 8 * std.time.ns_per_s;
-    while (!done.load(.acquire)) {
-        if (std.time.nanoTimestamp() > deadline) {
-            std.debug.print(
-                "\n[WARN] zig_delete_files timed out – accept the macOS Automation dialog " ++
-                    "or grant Finder access in System Settings → Privacy & Security → Automation\n",
-                .{},
-            );
-            return; // skip rather than hang
-        }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
-    }
+test "zig_compress and zig_uncompress round-trip" {
+    const io = getIo();
+    const base = try testBasePath();
+    defer gpa.free(base);
 
-    try std.testing.expect(ok_val.load(.acquire));
-    if (std.fs.accessAbsolute(del_file, .{})) |_| return error.FileStillExists else |_| {}
+    // Setup: create a directory with a dummy file
+    var srcb: [Dir.max_path_bytes + 1]u8 = undefined;
+    const work_dir = try std.fmt.bufPrintZ(&srcb, "{s}/compress_test", .{base});
+    Dir.deleteTree(.cwd(), io, work_dir) catch {};
+    Dir.createDirAbsolute(io, work_dir, File.Permissions.default_dir) catch {};
+    defer Dir.deleteTree(.cwd(), io, work_dir) catch {};
+
+    const src_file = try std.fmt.allocPrintSentinel(gpa, "{s}/hello.txt", .{work_dir}, 0);
+    defer gpa.free(src_file);
+    const fh = try Dir.createFileAbsolute(io, src_file, .{});
+    fh.writeStreamingAll(io, "hello 7z world\n") catch {};
+    fh.close(io);
+
+    // Find the 7zz binary (relative to project root)
+    const tio = getIo();
+    const cwd_path = try std.process.currentPathAlloc(tio, gpa);
+    defer gpa.free(cwd_path);
+    const sevenzz = try std.fmt.allocPrintSentinel(gpa, "{s}/bin/7zz", .{cwd_path}, 0);
+    defer gpa.free(sevenzz);
+
+    // 1) Compress
+    const archive = try std.fmt.allocPrintSentinel(gpa, "{s}/hello.7z", .{work_dir}, 0);
+    defer gpa.free(archive);
+
+    var comp_ctx = DoneCtx{};
+    const comp_ptrs = [_][*:0]const u8{src_file.ptr};
+    zig_compress(sevenzz, &comp_ptrs, 1, archive.ptr, &comp_ctx, DoneCtx.onProgress, DoneCtx.onDone);
+    try std.testing.expect(comp_ctx.wait());
+
+    // Archive must exist
+    try Dir.accessAbsolute(io, archive, .{});
+
+    // 2) Delete original file so we can verify the uncompress recreates it
+    Dir.deleteFileAbsolute(io, src_file) catch {};
+
+    // 3) Uncompress into a sub-directory
+    const extract_dir = try std.fmt.allocPrintSentinel(gpa, "{s}/extracted", .{work_dir}, 0);
+    defer gpa.free(extract_dir);
+
+    var decomp_ctx = DoneCtx{};
+    zig_uncompress(sevenzz, archive.ptr, extract_dir.ptr, &decomp_ctx, DoneCtx.onProgress, DoneCtx.onDone);
+    try std.testing.expect(decomp_ctx.wait());
+
+    // The extracted file must exist
+    const extracted_file = try std.fmt.allocPrintSentinel(gpa, "{s}/hello.txt", .{extract_dir}, 0);
+    defer gpa.free(extracted_file);
+    try Dir.accessAbsolute(io, extracted_file, .{});
+
+    // Verify content
+    const df = try Dir.openFileAbsolute(io, extracted_file, .{});
+    defer df.close(io);
+    var content: [64]u8 = undefined;
+    const n = df.readStreaming(io, &.{&content}) catch 0;
+    try std.testing.expectEqualStrings("hello 7z world\n", content[0..n]);
 }

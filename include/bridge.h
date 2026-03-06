@@ -98,6 +98,23 @@ bool zig_create_directory(const char *path, char *err_buf, uint64_t err_buf_len)
 // Rename / move single item (same-volume fast path)
 bool zig_rename(const char *src, const char *dst, char *err_buf, uint64_t err_buf_len);
 
+// Async compress (7z archive).  sevenzz_path = path to the 7zz binary.
+void zig_compress(const char        *sevenzz_path,
+                  const char *const *src_paths,
+                  uint64_t           src_count,
+                  const char        *dst_archive,
+                  void              *ctx,
+                  ZigProgressCallback   on_progress,
+                  ZigCompletionCallback on_done);
+
+// Async uncompress (7z / zip archive).
+void zig_uncompress(const char *sevenzz_path,
+                    const char *archive_path,
+                    const char *dst_dir,
+                    void       *ctx,
+                    ZigProgressCallback   on_progress,
+                    ZigCompletionCallback on_done);
+
 // Initialise Zig runtime (call once from main before anything else)
 void zig_init(void);
 

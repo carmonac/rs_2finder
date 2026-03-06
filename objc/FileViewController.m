@@ -366,6 +366,21 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
         [[menu addItemWithTitle:@"Renombrar"           action:@selector(renameSelected:)   keyEquivalent:@""] setTarget:self];
         [[menu addItemWithTitle:@"Obtener informacion" action:@selector(showInfoSelected:) keyEquivalent:@""] setTarget:self];
         [menu addItem:[NSMenuItem separatorItem]];
+        // Compress / Uncompress
+        {
+            FileEntry *entry = _entries[(NSUInteger)row];
+            NSString *ext = entry.path.pathExtension.lowercaseString;
+            BOOL isArchive = [ext isEqualToString:@"7z"] || [ext isEqualToString:@"zip"] ||
+                             [ext isEqualToString:@"rar"] || [ext isEqualToString:@"tar"] ||
+                             [ext isEqualToString:@"gz"] || [ext isEqualToString:@"bz2"] ||
+                             [ext isEqualToString:@"xz"];
+            if (isArchive) {
+                [[menu addItemWithTitle:@"Descomprimir" action:@selector(uncompressSelected:) keyEquivalent:@""] setTarget:self];
+            } else {
+                [[menu addItemWithTitle:@"Comprimir" action:@selector(compressSelected:) keyEquivalent:@""] setTarget:self];
+            }
+        }
+        [menu addItem:[NSMenuItem separatorItem]];
         [[menu addItemWithTitle:@"Mover a la papelera" action:@selector(deleteSelected:)  keyEquivalent:@""] setTarget:self];
         [menu addItem:[NSMenuItem separatorItem]];
     }
@@ -625,6 +640,82 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
     _clipboardPaths = nil;
     _clipboardOp    = ClipboardOperationNone;
     [_tableView reloadData];
+}
+
+- (IBAction)compressSelected:(id)sender {
+    NSArray<NSString *> *paths = [self selectedPaths];
+    if (!paths.count) return;
+
+    // Archive name: based on the first selected item
+    NSString *baseName = paths.firstObject.lastPathComponent.stringByDeletingPathExtension;
+    NSString *archive  = [_currentPath stringByAppendingPathComponent:
+                          [baseName stringByAppendingString:@".7z"]];
+
+    NSString *sevenzzPath = [self sevenzzPath];
+    if (!sevenzzPath) {
+        [self showErrorMessage:@"No se encontró el binario 7zz"];
+        return;
+    }
+
+    NSUInteger count = paths.count;
+    const char **cPaths = malloc(count * sizeof(char *));
+    char **owned = malloc(count * sizeof(char *));
+    if (!cPaths || !owned) { free(cPaths); free(owned); return; }
+    for (NSUInteger i = 0; i < count; i++) {
+        owned[i] = strdup(paths[i].UTF8String);
+        cPaths[i] = owned[i];
+    }
+
+    __weak typeof(self) wself = self;
+    ProgressWindowController *pwc = [[ProgressWindowController alloc]
+                                        initWithTitle:@"Comprimiendo"
+                                    destinationFolder:_currentPath
+                                      refreshCallback:^{ [wself loadPath:wself.currentPath]; }];
+    [pwc showWindow:nil];
+    void *ctx = (__bridge_retained void *)pwc;
+    zig_compress(sevenzzPath.UTF8String, cPaths, (uint64_t)count,
+                 archive.UTF8String, ctx, progressCb, doneCb);
+    for (NSUInteger i = 0; i < count; i++) free(owned[i]);
+    free(owned);
+    free(cPaths);
+}
+
+- (IBAction)uncompressSelected:(id)sender {
+    NSInteger row = _tableView.selectedRow;
+    if (row < 0) return;
+    FileEntry *entry = _entries[(NSUInteger)row];
+
+    NSString *sevenzzPath = [self sevenzzPath];
+    if (!sevenzzPath) {
+        [self showErrorMessage:@"No se encontró el binario 7zz"];
+        return;
+    }
+
+    // Extract to a folder with the archive's base name
+    NSString *dstDir = [_currentPath stringByAppendingPathComponent:
+                        entry.name.stringByDeletingPathExtension];
+
+    __weak typeof(self) wself = self;
+    ProgressWindowController *pwc = [[ProgressWindowController alloc]
+                                        initWithTitle:@"Descomprimiendo"
+                                    destinationFolder:_currentPath
+                                      refreshCallback:^{ [wself loadPath:wself.currentPath]; }];
+    [pwc showWindow:nil];
+    void *ctx = (__bridge_retained void *)pwc;
+    zig_uncompress(sevenzzPath.UTF8String, entry.path.UTF8String,
+                   dstDir.UTF8String, ctx, progressCb, doneCb);
+}
+
+- (NSString *)sevenzzPath {
+    NSString *bundled = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"7zz"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:bundled]) return bundled;
+    // Fallback: check bin/7zz relative to executable (for zig build run)
+    // Executable is at <project>/zig-out/bin/rs_2finder → go up 2 levels to project root
+    NSString *exeDir = NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent;
+    NSString *dev = [[exeDir stringByAppendingPathComponent:@"../../bin/7zz"] stringByStandardizingPath];
+    NSString *resolved = dev;
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:resolved]) return resolved;
+    return nil;
 }
 
 - (IBAction)newFolderAction:(id)sender  { [self createNewFolderInPath:_currentPath]; }

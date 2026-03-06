@@ -18,19 +18,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const mod = exe.root_module;
+
     // ── Objective-C source files ─────────────────────────────────────────────
-    // Note: -fmodules is intentionally omitted – Zig's bundled float.h conflicts
-    // with the macOS 26 SDK module map. Plain #import works fine without it.
     const objc_flags = &[_][]const u8{
-        "-fobjc-arc", // ARC memory management
+        "-fobjc-arc",
         "-std=gnu11",
-        "-fno-sanitize=undefined", // Apple SDK headers (dispatch/once.h) use
-        // __builtin_assume() which trips Zig's UBSan in
-        // Debug mode. Disable UBSan for ObjC translation
-        // units; Zig's own checks remain active.
+        "-fno-sanitize=undefined",
     };
 
-    exe.addCSourceFiles(.{
+    mod.addCSourceFiles(.{
         .files = &[_][]const u8{
             "objc/AppDelegate.m",
             "objc/FinderWindowController.m",
@@ -43,17 +40,17 @@ pub fn build(b: *std.Build) void {
     });
 
     // ── Include paths ────────────────────────────────────────────────────────
-    exe.addIncludePath(b.path("include"));
-    exe.addIncludePath(b.path("objc")); // so .m files can #import each other
+    mod.addIncludePath(b.path("include"));
+    mod.addIncludePath(b.path("objc"));
 
     // ── macOS frameworks ─────────────────────────────────────────────────────
-    exe.linkFramework("Cocoa");
-    exe.linkFramework("Foundation");
-    exe.linkFramework("UniformTypeIdentifiers"); // UTTypeCopyDescription
-    exe.linkFramework("Quartz");                 // QLPreviewPanel
+    mod.linkFramework("Cocoa", .{});
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("UniformTypeIdentifiers", .{});
+    mod.linkFramework("Quartz", .{});
 
     // ── libc (required for ObjC runtime) ────────────────────────────────────
-    exe.linkLibC();
+    mod.link_libc = true;
 
     // ── Install ──────────────────────────────────────────────────────────────
     b.installArtifact(exe);
@@ -65,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Compilar y ejecutar rs_2finder");
     run_step.dependOn(&run_cmd.step);
 
-    // ── zig build bundle  (creates rs_2finder.app in zig-out/) ───────────────
+    // ── zig build bundle  (creates R2 Finder.app in zig-out/) ───────────────
     const bundle_step = b.step("bundle", "Crear R2 Finder.app en zig-out/");
     const bundle = makeBundleStep(b, exe);
     bundle_step.dependOn(bundle);
@@ -117,8 +114,6 @@ fn makeBundleStep(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
         \\</dict>
         \\</plist>
     ;
-    // b.addWriteFile writes to the Zig cache; pipe it through addInstallFile
-    // to land it in zig-out/R2 Finder.app/Contents/Info.plist.
     const gen_plist = b.addWriteFile("Info.plist", plist);
     const install_plist = b.addInstallFile(
         gen_plist.getDirectory().path(b, "Info.plist"),
@@ -138,10 +133,17 @@ fn makeBundleStep(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
         "R2 Finder.app/Contents/Resources/AppIcon.icns",
     );
 
+    // 4) Copy 7zz binary into Resources/
+    const copy_7zz = b.addInstallFile(
+        b.path("bin/7zz"),
+        "R2 Finder.app/Contents/Resources/7zz",
+    );
+
     // Combine into a single step via a dummy WriteFile
     const done = b.addWriteFile("R2 Finder.app/.built", "ok");
     done.step.dependOn(&install_plist.step);
     done.step.dependOn(&copy_exe.step);
     done.step.dependOn(&copy_icon.step);
+    done.step.dependOn(&copy_7zz.step);
     return &done.step;
 }

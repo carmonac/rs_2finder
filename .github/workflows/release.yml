@@ -19,10 +19,10 @@ jobs:
           # Use a PAT or the default token – push to main requires write access.
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.16.0-dev
         run: |
-          curl -L https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz | tar -xJ
-          echo "$PWD/zig-aarch64-macos-0.15.2" >> $GITHUB_PATH
+          curl -L https://ziglang.org/builds/zig-aarch64-macos-0.16.0-dev.2682+02142a54d.tar.xz | tar -xJ
+          echo "$PWD/zig-aarch64-macos-0.16.0-dev.2682+02142a54d" >> $GITHUB_PATH
 
       # ── Build ──────────────────────────────────────────────────────────────
       - name: Build app bundle (ReleaseFast)
@@ -75,12 +75,12 @@ jobs:
           <!-- DOWNLOAD_SECTION_START -->
           ## Download
 
-          [**R2 Finder {tag} — Descargar DMG**]({dmg_url})
+          [**R2 Finder {tag} — Download DMG**]({dmg_url})
 
-          Arrastra **R2 Finder.app** a tu carpeta `/Applications` desde el DMG.
+          Drag **R2 Finder.app** from the DMG to your `/Applications` folder.
 
-          Como la aplicación no está notarizada, macOS la pondrá en cuarentena la
-          primera vez. Ejecuta este comando en Terminal **antes** de abrirla:
+          **Important:** Since the application is not notarized, macOS will quarantine it the
+          first time. Run this command in Terminal **before** opening it:
 
           ```bash
           xattr -d com.apple.quarantine /Applications/R2\\ Finder.app
