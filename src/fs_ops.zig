@@ -707,6 +707,7 @@ fn runArchive(job: *ArchiveJob) !void {
     if (job.is_compress) {
         try argv.append("a");
         try argv.append("-y");
+        try argv.append("-bsp1"); // enable progress to stdout
         try argv.append(std.mem.sliceTo(job.archive_path, 0));
         if (job.src_paths) |paths| {
             for (paths) |p| try argv.append(std.mem.sliceTo(p, 0));
@@ -714,6 +715,7 @@ fn runArchive(job: *ArchiveJob) !void {
     } else {
         try argv.append("x");
         try argv.append("-y");
+        try argv.append("-bsp1"); // enable progress to stdout
         try argv.append(std.mem.sliceTo(job.archive_path, 0));
     }
 
@@ -736,6 +738,7 @@ fn runArchive(job: *ArchiveJob) !void {
         .stderr = .pipe,
     });
 
+    // Drain stderr in a separate thread (just capture it for error reporting)
     const DrainCtx = struct {
         file: File,
         io_handle: Io,
@@ -756,12 +759,37 @@ fn runArchive(job: *ArchiveJob) !void {
         }
     };
 
-    var stdoutCtx = DrainCtx{ .file = child.stdout.?, .io_handle = io };
     var stderrCtx = DrainCtx{ .file = child.stderr.?, .io_handle = io };
-    const stdoutThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stdoutCtx});
     const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
 
-    stdoutThread.join();
+    // Read stdout in this thread, parsing 7zz progress lines (e.g. " 42%" or "100%")
+    {
+        const stdout = child.stdout.?;
+        var line_buf: [1024]u8 = undefined;
+        var line_len: usize = 0;
+        var read_buf: [4096]u8 = undefined;
+        while (true) {
+            const n = stdout.readStreaming(io, &.{&read_buf}) catch break;
+            if (n == 0) break;
+            for (read_buf[0..n]) |byte| {
+                if (byte == '\n' or byte == '\r') {
+                    if (line_len > 0) {
+                        const pct = parseSevenZPercent(line_buf[0..line_len]);
+                        if (pct) |p| {
+                            job.on_progress(job.ctx, p / 100.0, 0, 0, 0, 0);
+                        }
+                        line_len = 0;
+                    }
+                } else {
+                    if (line_len < line_buf.len) {
+                        line_buf[line_len] = byte;
+                        line_len += 1;
+                    }
+                }
+            }
+        }
+    }
+
     stderrThread.join();
 
     const term = try child.wait(io);
@@ -783,6 +811,25 @@ fn runArchive(job: *ArchiveJob) !void {
     }
 
     job.on_done(job.ctx, true, null);
+}
+
+/// Parse a percentage from 7zz progress output lines like " 42%" or "100%".
+fn parseSevenZPercent(line: []const u8) ?f64 {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    // Look for a number followed by '%'
+    if (std.mem.indexOfScalar(u8, trimmed, '%')) |pct_pos| {
+        if (pct_pos == 0) return null;
+        // Find the start of the number (scan backwards from '%')
+        var start: usize = pct_pos;
+        while (start > 0 and (trimmed[start - 1] >= '0' and trimmed[start - 1] <= '9')) {
+            start -= 1;
+        }
+        if (start == pct_pos) return null;
+        const num_str = trimmed[start..pct_pos];
+        const val = std.fmt.parseInt(u32, num_str, 10) catch return null;
+        return @floatFromInt(val);
+    }
+    return null;
 }
 
 // ===========================================================================
