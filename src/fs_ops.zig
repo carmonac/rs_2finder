@@ -436,8 +436,7 @@ fn runTransfer(job: *TransferJob) !void {
         .stderr = .pipe,
     });
 
-    // Drain stdout and stderr in parallel threads so neither pipe ever fills
-    // and deadlocks rsync.
+    // Drain stderr in a separate thread so the pipe never fills and deadlocks rsync.
     const DrainCtx = struct {
         file: File,
         io_handle: Io,
@@ -458,12 +457,37 @@ fn runTransfer(job: *TransferJob) !void {
         }
     };
 
-    var stdoutCtx = DrainCtx{ .file = child.stdout.?, .io_handle = io };
     var stderrCtx = DrainCtx{ .file = child.stderr.?, .io_handle = io };
-    const stdoutThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stdoutCtx});
     const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
 
-    stdoutThread.join();
+    // Read stdout, parsing rsync --progress output for percentage (e.g. " 45%")
+    {
+        const stdout = child.stdout.?;
+        var line_buf: [1024]u8 = undefined;
+        var line_len: usize = 0;
+        var read_buf: [4096]u8 = undefined;
+        while (true) {
+            const n = stdout.readStreaming(io, &.{&read_buf}) catch break;
+            if (n == 0) break;
+            for (read_buf[0..n]) |byte| {
+                if (byte == '\n' or byte == '\r') {
+                    if (line_len > 0) {
+                        const pct = parseRsyncPercent(line_buf[0..line_len]);
+                        if (pct) |p| {
+                            job.on_progress(job.ctx, p / 100.0, 0, 0, 0, 0);
+                        }
+                        line_len = 0;
+                    }
+                } else {
+                    if (line_len < line_buf.len) {
+                        line_buf[line_len] = byte;
+                        line_len += 1;
+                    }
+                }
+            }
+        }
+    }
+
     stderrThread.join();
 
     const term = try child.wait(io);
@@ -830,6 +854,13 @@ fn parseSevenZPercent(line: []const u8) ?f64 {
         return @floatFromInt(val);
     }
     return null;
+}
+
+/// Parse percentage from rsync --progress output.
+/// Lines look like: "  1,234,567  45%   12.34MB/s    0:01:23"
+fn parseRsyncPercent(line: []const u8) ?f64 {
+    // Same logic — find a number before '%'
+    return parseSevenZPercent(line);
 }
 
 // ===========================================================================

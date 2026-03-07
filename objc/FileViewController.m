@@ -353,8 +353,12 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 
 - (NSMenu *)contextMenuForTableView:(NSTableView *)tv clickedRow:(NSInteger)row {
     if (row >= 0) {
-        [tv selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row]
-            byExtendingSelection:NO];
+        // Only change selection if the clicked row is not already selected
+        // (preserves multi-selection for context menu actions)
+        if (![tv.selectedRowIndexes containsIndex:(NSUInteger)row]) {
+            [tv selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row]
+                byExtendingSelection:NO];
+        }
     }
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@""];
     if (row >= 0) {
@@ -575,15 +579,16 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
     __weak typeof(self) wself = self;
     [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse resp) {
         if (resp != NSAlertFirstButtonReturn) return;
-        NSUInteger count = paths.count;
-        const char **cPaths = malloc(count * sizeof(char *));
-        if (!cPaths) return;
-        for (NSUInteger i = 0; i < count; i++) cPaths[i] = paths[i].UTF8String;
-        char errBuf[512] = {0};
-        BOOL ok = zig_delete_files(cPaths, (uint64_t)count, errBuf, sizeof(errBuf));
-        free(cPaths);
-        if (!ok) [wself showErrorMessage:@(errBuf)];
-        else     [wself loadPath:wself.currentPath];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSError *error = nil;
+        for (NSString *path in paths) {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            if (![fm trashItemAtURL:url resultingItemURL:nil error:&error]) {
+                [wself showErrorMessage:error.localizedDescription];
+                return;
+            }
+        }
+        [wself loadPath:wself.currentPath];
     }];
 }
 
