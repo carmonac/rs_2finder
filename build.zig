@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     const bundle = makeBundleStep(b, exe);
     bundle_step.dependOn(bundle);
 
-    // ── zig build test-fs  (fs_ops unit tests, no ObjC deps needed) ──────────
+    // ── zig build test / test-fs  (Zig unit tests, no ObjC deps needed) ─────
     const fs_test_mod = b.createModule(.{
         .root_source_file = b.path("src/fs_ops.zig"),
         .target = target,
@@ -77,12 +77,8 @@ pub fn build(b: *std.Build) void {
     const run_fs_tests = b.addRunArtifact(fs_tests);
     const fs_test_step = b.step("test-fs", "Ejecutar los tests unitarios de fs_ops");
     fs_test_step.dependOn(&run_fs_tests.step);
-
-    // ── zig build test ───────────────────────────────────────────────────────
-    const unit_tests = b.addTest(.{ .root_module = exe.root_module });
-    const run_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Ejecutar los tests unitarios de Zig");
-    test_step.dependOn(&run_tests.step);
+    const test_step = b.step("test", "Ejecutar todos los tests unitarios de Zig");
+    test_step.dependOn(&run_fs_tests.step);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
