@@ -166,8 +166,8 @@ fn runTransfer(job: *TransferJob) !void {
 
     try argv.append(job.rsync_path);
     try argv.append("-a"); // archive: recursive, preserve attrs/symlinks/perms
-    try argv.append("-v"); // verbose: list files being transferred
-    try argv.append("--progress"); // per-file progress output
+    try argv.append("--info=progress2"); // overall progress
+    try argv.append("--no-inc-recursive"); // scan all files upfront for accurate totals
     if (!job.overwrite) try argv.append("--ignore-existing");
     if (job.is_move) try argv.append("--remove-source-files"); // atomic move
 
@@ -204,8 +204,10 @@ fn runTransfer(job: *TransferJob) !void {
     var stderrCtx = DrainCtx{ .file = child.stderr.?, .io_handle = io };
     const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
 
-    // Read stdout, parsing rsync --progress per-file output.
-    // Format (GNU rsync 3.4.1): "  10485760 100%  352.23MB/s   00:00:00 (xfr#1, to-chk=5/10)"
+    // Read stdout, parsing rsync --info=progress2 output.
+    // Format: "  104857600  50%  399.88MB/s    0:00:00 (xfr#10, to-chk=10/21)"
+    // Intermediate lines may lack the "(xfr#..., to-chk=...)" part.
+    // The percentage is overall progress; the time field is elapsed (not ETA).
     {
         const stdout = child.stdout.?;
         var line_buf: [1024]u8 = undefined;
@@ -218,14 +220,25 @@ fn runTransfer(job: *TransferJob) !void {
                 if (byte == '\n' or byte == '\r') {
                     if (line_len > 0) {
                         const info = parseRsyncProgress(line_buf[0..line_len]);
-                        if (info.overall_progress != null) {
+                        if (info.progress >= 0) {
+                            // Estimate ETA: remaining_bytes / speed
+                            var eta: i64 = 0;
+                            if (info.speed > 0 and info.progress > 0 and info.progress < 1.0) {
+                                const total_est = @as(f64, @floatFromInt(info.bytes)) / info.progress;
+                                const remaining = total_est - @as(f64, @floatFromInt(info.bytes));
+                                eta = @intFromFloat(remaining / info.speed);
+                            }
+                            const total_bytes: u64 = if (info.progress > 0)
+                                @intFromFloat(@as(f64, @floatFromInt(info.bytes)) / info.progress)
+                            else
+                                0;
                             job.on_progress(
                                 job.ctx,
-                                info.overall_progress.?,
+                                info.progress,
                                 info.bytes,
-                                0,
+                                total_bytes,
                                 info.speed,
-                                info.eta,
+                                eta,
                             );
                         }
                         line_len = 0;
@@ -282,14 +295,14 @@ fn runTransfer(job: *TransferJob) !void {
 // ---------------------------------------------------------------------------
 
 const RsyncProgress = struct {
-    overall_progress: ?f64 = null, // 0.0 .. 1.0
+    progress: f64 = -1, // 0.0 .. 1.0, negative = not a progress line
     bytes: u64 = 0,
     speed: f64 = 0,
-    eta: i64 = 0,
 };
 
-/// Parse rsync --progress per-file output line.
-/// Format (GNU rsync 3.4.1): "  10485760 100%  352.23MB/s   00:00:00 (xfr#1, to-chk=5/10)"
+/// Parse rsync --info=progress2 output line.
+/// Format: "  104857600  50%  399.88MB/s    0:00:00 (xfr#10, to-chk=10/21)"
+/// The percentage is overall transfer progress. Intermediate lines may omit the (xfr...) part.
 fn parseRsyncProgress(line: []const u8) RsyncProgress {
     var result = RsyncProgress{};
     const trimmed = std.mem.trim(u8, line, " \t");
@@ -298,38 +311,21 @@ fn parseRsyncProgress(line: []const u8) RsyncProgress {
     var it = std.mem.tokenizeAny(u8, trimmed, " \t");
 
     // First token: bytes transferred (may contain commas)
-    if (it.next()) |bytes_str| {
-        result.bytes = parseCommaNumber(bytes_str);
-    } else return result;
+    const bytes_str = it.next() orelse return result;
+    result.bytes = parseCommaNumber(bytes_str);
 
-    // Second token: percentage (e.g. "100%") — per-file percentage, skip
-    _ = it.next() orelse return result;
+    // Second token: percentage (e.g. "50%") — with --info=progress2 this is overall progress
+    const pct_str = it.next() orelse return result;
+    if (std.mem.indexOfScalar(u8, pct_str, '%')) |pct_pos| {
+        if (pct_pos > 0) {
+            const val = std.fmt.parseInt(u32, pct_str[0..pct_pos], 10) catch return result;
+            result.progress = @as(f64, @floatFromInt(val)) / 100.0;
+        }
+    } else return result;
 
     // Third token: speed (e.g. "352.23MB/s")
     if (it.next()) |speed_str| {
         result.speed = parseRsyncSpeed(speed_str);
-    } else return result;
-
-    // Fourth token: time (e.g. "00:00:00")
-    if (it.next()) |eta_str| {
-        result.eta = parseTimeToSeconds(eta_str);
-    } else return result;
-
-    // Remaining tokens may contain "(xfr#1, to-chk=5/10)"
-    // GNU rsync 3.4.1 uses "to-chk=" where X counts DOWN (remaining items).
-    // Progress = (total - remaining) / total
-    if (std.mem.indexOf(u8, trimmed, "to-chk=")) |pos| {
-        const after = trimmed[pos + "to-chk=".len ..];
-        // Parse "X/Y)"
-        if (std.mem.indexOfScalar(u8, after, '/')) |slash| {
-            var end = slash + 1;
-            while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
-            const remaining = std.fmt.parseInt(u64, after[0..slash], 10) catch return result;
-            const total = std.fmt.parseInt(u64, after[slash + 1 .. end], 10) catch return result;
-            if (total > 0) {
-                result.overall_progress = @as(f64, @floatFromInt(total - remaining)) / @as(f64, @floatFromInt(total));
-            }
-        }
     }
 
     return result;
@@ -381,34 +377,6 @@ fn parseSimpleFloat(s: []const u8) f64 {
         }
     }
     return int_part + frac_part;
-}
-
-fn parseTimeToSeconds(s: []const u8) i64 {
-    // Parse HH:MM:SS or MM:SS or SS
-    var parts: [3]i64 = .{ 0, 0, 0 };
-    var part_count: usize = 0;
-    var current: i64 = 0;
-    for (s) |ch| {
-        if (ch == ':') {
-            if (part_count < 3) {
-                parts[part_count] = current;
-                part_count += 1;
-                current = 0;
-            }
-        } else if (ch >= '0' and ch <= '9') {
-            current = current * 10 + (ch - '0');
-        }
-    }
-    if (part_count < 3) {
-        parts[part_count] = current;
-        part_count += 1;
-    }
-    return switch (part_count) {
-        1 => parts[0],
-        2 => parts[0] * 60 + parts[1],
-        3 => parts[0] * 3600 + parts[1] * 60 + parts[2],
-        else => 0,
-    };
 }
 
 // ===========================================================================
