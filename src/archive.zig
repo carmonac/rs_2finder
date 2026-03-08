@@ -17,6 +17,7 @@ const ArchiveJob = struct {
     archive_path: [:0]u8, // dst archive (compress) or src archive (uncompress)
     dst_dir: ?[:0]u8, // only for uncompress
     is_compress: bool,
+    store_only: bool, // true = -mx0 (no compression, just store/split)
     volume_size_mb: u32, // 0 = no split, >0 = split into volumes of this size
     ctx: ?*anyopaque,
     on_progress: ZigProgressCallback,
@@ -68,6 +69,7 @@ pub fn zig_compress(
         },
         .dst_dir = null,
         .is_compress = true,
+        .store_only = false,
         .volume_size_mb = 0,
         .ctx = ctx,
         .on_progress = on_progress,
@@ -87,6 +89,7 @@ pub fn zig_compress_split(
     src_count: u64,
     dst_archive: [*:0]const u8,
     volume_size_mb: u32,
+    store_only: bool,
     ctx: ?*anyopaque,
     on_progress: ZigProgressCallback,
     on_done: ZigCompletionCallback,
@@ -127,6 +130,7 @@ pub fn zig_compress_split(
         },
         .dst_dir = null,
         .is_compress = true,
+        .store_only = store_only,
         .volume_size_mb = volume_size_mb,
         .ctx = ctx,
         .on_progress = on_progress,
@@ -170,6 +174,7 @@ pub fn zig_uncompress(
             return;
         },
         .is_compress = false,
+        .store_only = false,
         .volume_size_mb = 0,
         .ctx = ctx,
         .on_progress = on_progress,
@@ -218,6 +223,7 @@ fn runArchive(job: *ArchiveJob) !void {
         try argv.append("a");
         try argv.append("-y");
         try argv.append("-bsp1"); // enable progress to stdout
+        if (job.store_only) try argv.append("-mx0"); // no compression, just store
         if (job.volume_size_mb > 0) {
             vol_flag = try std.fmt.allocPrint(gpa, "-v{d}m", .{job.volume_size_mb});
             try argv.append(vol_flag.?);

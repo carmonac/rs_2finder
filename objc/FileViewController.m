@@ -382,8 +382,8 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
                 [[menu addItemWithTitle:@"Descomprimir" action:@selector(uncompressSelected:) keyEquivalent:@""] setTarget:self];
             } else {
                 [[menu addItemWithTitle:@"Comprimir" action:@selector(compressSelected:) keyEquivalent:@""] setTarget:self];
-                [[menu addItemWithTitle:@"Dividir en partes" action:@selector(splitSelected:) keyEquivalent:@""] setTarget:self];
             }
+            [[menu addItemWithTitle:@"Dividir en partes" action:@selector(splitSelected:) keyEquivalent:@""] setTarget:self];
         }
         [menu addItem:[NSMenuItem separatorItem]];
         [[menu addItemWithTitle:@"Mover a la papelera" action:@selector(deleteSelected:)  keyEquivalent:@""] setTarget:self];
@@ -788,6 +788,17 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
             return;
         }
 
+        // Detect if all selected files are already compressed archives
+        NSSet *archiveExts = [NSSet setWithObjects:@"7z", @"zip", @"rar", @"tar",
+                              @"gz", @"bz2", @"xz", @"tgz", @"tbz2", @"txz", nil];
+        BOOL storeOnly = YES;
+        for (NSString *p in paths) {
+            if (![archiveExts containsObject:p.pathExtension.lowercaseString]) {
+                storeOnly = NO;
+                break;
+            }
+        }
+
         NSString *baseName = paths.firstObject.lastPathComponent.stringByDeletingPathExtension;
         NSString *archive  = [self->_currentPath stringByAppendingPathComponent:
                               [baseName stringByAppendingString:@".7z"]];
@@ -809,7 +820,7 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
         [pwc showWindow:nil];
         void *ctx = (__bridge_retained void *)pwc;
         zig_compress_split(sevenzzPath.UTF8String, cPaths, (uint64_t)count,
-                           archive.UTF8String, (uint32_t)sizeMB,
+                           archive.UTF8String, (uint32_t)sizeMB, storeOnly,
                            ctx, progressCb, doneCb);
         for (NSUInteger i = 0; i < count; i++) free(owned[i]);
         free(owned);

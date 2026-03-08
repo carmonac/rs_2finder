@@ -110,11 +110,13 @@ void zig_compress(const char        *sevenzz_path,
                   ZigCompletionCallback on_done);
 
 // Async compress + split into volumes of volume_size_mb megabytes.
+// store_only=true skips compression (-mx0), useful for already-compressed files.
 void zig_compress_split(const char        *sevenzz_path,
                         const char *const *src_paths,
                         uint64_t           src_count,
                         const char        *dst_archive,
                         uint32_t           volume_size_mb,
+                        bool               store_only,
                         void              *ctx,
                         ZigProgressCallback   on_progress,
                         ZigCompletionCallback on_done);
