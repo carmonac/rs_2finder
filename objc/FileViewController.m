@@ -553,10 +553,15 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
     // __bridge_retained bumps retain count by 1; doneCb will consume it
     // with __bridge_transfer, giving the block sole ownership up to dealloc.
     void *ctx = (__bridge_retained void *)pwc;
+    NSString *rsync = [self rsyncPath];
+    if (!rsync) {
+        [self showErrorMessage:@"No se encontró el binario rsync"];
+        return;
+    }
     if (isMove)
-        zig_move_files(cPaths, (uint64_t)count, dstDir.UTF8String, overwrite, ctx, progressCb, doneCb);
+        zig_move_files(rsync.UTF8String, cPaths, (uint64_t)count, dstDir.UTF8String, overwrite, ctx, progressCb, doneCb);
     else
-        zig_copy_files(cPaths, (uint64_t)count, dstDir.UTF8String, overwrite, ctx, progressCb, doneCb);
+        zig_copy_files(rsync.UTF8String, cPaths, (uint64_t)count, dstDir.UTF8String, overwrite, ctx, progressCb, doneCb);
     // Zig has already dupeZ'd every string; free our heap copies.
     for (NSUInteger i = 0; i < count; i++) free(owned[i]);
     free(owned);
@@ -718,8 +723,17 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
     // Executable is at <project>/zig-out/bin/rs_2finder → go up 2 levels to project root
     NSString *exeDir = NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent;
     NSString *dev = [[exeDir stringByAppendingPathComponent:@"../../bin/7zz"] stringByStandardizingPath];
-    NSString *resolved = dev;
-    if ([[NSFileManager defaultManager] isExecutableFileAtPath:resolved]) return resolved;
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:dev]) return dev;
+    return nil;
+}
+
+- (NSString *)rsyncPath {
+    NSString *bundled = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"rsync"];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:bundled]) return bundled;
+    // Fallback: check bin/rsync relative to executable (for zig build run)
+    NSString *exeDir = NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent;
+    NSString *dev = [[exeDir stringByAppendingPathComponent:@"../../bin/rsync"] stringByStandardizingPath];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:dev]) return dev;
     return nil;
 }
 

@@ -307,6 +307,7 @@ export fn zig_check_collision(
 // ---------------------------------------------------------------------------
 
 const TransferJob = struct {
+    rsync_path: [:0]u8,
     src_paths: [][:0]u8,
     dst_dir: [:0]u8,
     overwrite: bool,
@@ -317,6 +318,7 @@ const TransferJob = struct {
 };
 
 export fn zig_copy_files(
+    rsync_path: [*:0]const u8,
     src_paths: [*]const [*:0]const u8,
     src_count: u64,
     dst_dir: [*:0]const u8,
@@ -325,10 +327,11 @@ export fn zig_copy_files(
     on_progress: ZigProgressCallback,
     on_done: ZigCompletionCallback,
 ) void {
-    spawnTransfer(src_paths, src_count, dst_dir, overwrite, false, ctx, on_progress, on_done);
+    spawnTransfer(rsync_path, src_paths, src_count, dst_dir, overwrite, false, ctx, on_progress, on_done);
 }
 
 export fn zig_move_files(
+    rsync_path: [*:0]const u8,
     src_paths: [*]const [*:0]const u8,
     src_count: u64,
     dst_dir: [*:0]const u8,
@@ -337,10 +340,11 @@ export fn zig_move_files(
     on_progress: ZigProgressCallback,
     on_done: ZigCompletionCallback,
 ) void {
-    spawnTransfer(src_paths, src_count, dst_dir, overwrite, true, ctx, on_progress, on_done);
+    spawnTransfer(rsync_path, src_paths, src_count, dst_dir, overwrite, true, ctx, on_progress, on_done);
 }
 
 fn spawnTransfer(
+    rsync_path: [*:0]const u8,
     src_paths: [*]const [*:0]const u8,
     src_count: u64,
     dst_dir: [*:0]const u8,
@@ -369,6 +373,13 @@ fn spawnTransfer(
         return;
     };
     job.* = .{
+        .rsync_path = gpa.dupeZ(u8, std.mem.sliceTo(rsync_path, 0)) catch {
+            for (paths) |p| gpa.free(p);
+            gpa.free(paths);
+            gpa.destroy(job);
+            on_done(ctx, false, "sin memoria");
+            return;
+        },
         .src_paths = paths,
         .dst_dir = gpa.dupeZ(u8, std.mem.sliceTo(dst_dir, 0)) catch {
             for (paths) |p| gpa.free(p);
@@ -392,6 +403,7 @@ fn spawnTransfer(
 }
 
 fn freeJob(job: *TransferJob) void {
+    gpa.free(job.rsync_path);
     for (job.src_paths) |p| gpa.free(p);
     gpa.free(job.src_paths);
     gpa.free(job.dst_dir);
@@ -421,7 +433,7 @@ fn runTransfer(job: *TransferJob) !void {
     var argv = std.array_list.Managed([]const u8).init(gpa);
     defer argv.deinit();
 
-    try argv.append("/usr/bin/rsync");
+    try argv.append(job.rsync_path);
     try argv.append("-a"); // archive: recursive, preserve attrs/symlinks/perms
     try argv.append("-v"); // verbose: list files being transferred
     try argv.append("--progress"); // per-file progress output
@@ -462,7 +474,7 @@ fn runTransfer(job: *TransferJob) !void {
     const stderrThread = try std.Thread.spawn(.{}, DrainCtx.run, .{&stderrCtx});
 
     // Read stdout, parsing rsync --progress per-file output.
-    // Format: "  10485760 100%  352.23MB/s   00:00:00 (xfer#1, to-check=5/10)"
+    // Format (GNU rsync 3.4.1): "  10485760 100%  352.23MB/s   00:00:00 (xfr#1, to-chk=5/10)"
     {
         const stdout = child.stdout.?;
         var line_buf: [1024]u8 = undefined;
@@ -873,7 +885,7 @@ const RsyncProgress = struct {
 };
 
 /// Parse rsync --progress per-file output line.
-/// Format: "  10485760 100%  352.23MB/s   00:00:00 (xfer#1, to-check=5/10)"
+/// Format (GNU rsync 3.4.1): "  10485760 100%  352.23MB/s   00:00:00 (xfr#1, to-chk=5/10)"
 fn parseRsyncProgress(line: []const u8) RsyncProgress {
     var result = RsyncProgress{};
     const trimmed = std.mem.trim(u8, line, " \t");
@@ -899,19 +911,19 @@ fn parseRsyncProgress(line: []const u8) RsyncProgress {
         result.eta = parseTimeToSeconds(eta_str);
     } else return result;
 
-    // Remaining tokens may contain "(xfer#1, to-check=5/10)"
-    // Look for "to-check=" in the rest of the line
-    if (std.mem.indexOf(u8, trimmed, "to-check=")) |pos| {
-        const after = trimmed[pos + "to-check=".len ..];
+    // Remaining tokens may contain "(xfr#1, to-chk=5/10)"
+    // GNU rsync 3.4.1 uses "to-chk=" where X counts DOWN (remaining items).
+    // Progress = (total - remaining) / total
+    if (std.mem.indexOf(u8, trimmed, "to-chk=")) |pos| {
+        const after = trimmed[pos + "to-chk=".len ..];
         // Parse "X/Y)"
         if (std.mem.indexOfScalar(u8, after, '/')) |slash| {
             var end = slash + 1;
             while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
-            const checked = std.fmt.parseInt(u64, after[0..slash], 10) catch return result;
+            const remaining = std.fmt.parseInt(u64, after[0..slash], 10) catch return result;
             const total = std.fmt.parseInt(u64, after[slash + 1 .. end], 10) catch return result;
             if (total > 0) {
-                // macOS openrsync: to-check counts UP (files checked so far)
-                result.overall_progress = @as(f64, @floatFromInt(checked)) / @as(f64, @floatFromInt(total));
+                result.overall_progress = @as(f64, @floatFromInt(total - remaining)) / @as(f64, @floatFromInt(total));
             }
         }
     }
@@ -1030,6 +1042,13 @@ fn testBasePath() ![]const u8 {
     @memcpy(result[0..cwd.len], cwd);
     @memcpy(result[cwd.len..], "/test_dir");
     return result;
+}
+
+fn testRsyncPath() ![:0]u8 {
+    const tio = getIo();
+    const cwd = try std.process.currentPathAlloc(tio, gpa);
+    defer gpa.free(cwd);
+    return try std.fmt.allocPrintSentinel(gpa, "{s}/bin/rsync", .{cwd}, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,9 +1240,12 @@ test "zig_copy_files copies file to destination" {
     fh.writeStreamingAll(io, "hello from rs_2finder\n") catch {};
     fh.close(io);
 
+    const rsync = try testRsyncPath();
+    defer gpa.free(rsync);
+
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
-    zig_copy_files(&ptrs, 1, dst_dir.ptr, true, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
+    zig_copy_files(rsync, &ptrs, 1, dst_dir.ptr, true, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
     try std.testing.expect(ctx.wait());
 
     // dst has the copy
@@ -1265,10 +1287,13 @@ test "zig_copy_files respects overwrite=false" {
     sf.writeStreamingAll(io, "new") catch {};
     sf.close(io);
 
+    const rsync = try testRsyncPath();
+    defer gpa.free(rsync);
+
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
     // overwrite = false → rsync --ignore-existing
-    zig_copy_files(&ptrs, 1, dst_dir.ptr, false, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
+    zig_copy_files(rsync, &ptrs, 1, dst_dir.ptr, false, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
     try std.testing.expect(ctx.wait());
 
     // dst content should still be "original"
@@ -1305,9 +1330,12 @@ test "zig_move_files moves file, removes source" {
     fh.writeStreamingAll(io, "move me\n") catch {};
     fh.close(io);
 
+    const rsync = try testRsyncPath();
+    defer gpa.free(rsync);
+
     var ctx = DoneCtx{};
     const ptrs = [_][*:0]const u8{src_file.ptr};
-    zig_move_files(&ptrs, 1, dst_dir.ptr, true, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
+    zig_move_files(rsync, &ptrs, 1, dst_dir.ptr, true, &ctx, DoneCtx.onProgress, DoneCtx.onDone);
     try std.testing.expect(ctx.wait());
 
     // dst has the file

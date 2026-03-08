@@ -64,9 +64,10 @@ void           zig_free_volume_list(ZigVolumeList *list);
 // Returns a ZigVolumeList reusing the same struct (name = display name, path = fs path).
 ZigVolumeList *zig_get_special_dirs(void);
 
-// Async copy (uses rsync  - spawns a thread).
+// Async copy (uses bundled rsync - spawns a thread).
 // ctx is passed back verbatim to the callbacks.
-void zig_copy_files(const char *const *src_paths,
+void zig_copy_files(const char       *rsync_path,
+                    const char *const *src_paths,
                     uint64_t          src_count,
                     const char       *dst_dir,
                     bool              overwrite,
@@ -75,7 +76,8 @@ void zig_copy_files(const char *const *src_paths,
                     ZigCompletionCallback on_done);
 
 // Async move (rsync + rm source on success).
-void zig_move_files(const char *const *src_paths,
+void zig_move_files(const char       *rsync_path,
+                    const char *const *src_paths,
                     uint64_t          src_count,
                     const char       *dst_dir,
                     bool              overwrite,

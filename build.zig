@@ -139,11 +139,18 @@ fn makeBundleStep(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
         "R2 Finder.app/Contents/Resources/7zz",
     );
 
+    // 5) Copy rsync binary into Resources/
+    const copy_rsync = b.addInstallFile(
+        b.path("bin/rsync"),
+        "R2 Finder.app/Contents/Resources/rsync",
+    );
+
     // Combine into a single step via a dummy WriteFile
     const done = b.addWriteFile("R2 Finder.app/.built", "ok");
     done.step.dependOn(&install_plist.step);
     done.step.dependOn(&copy_exe.step);
     done.step.dependOn(&copy_icon.step);
     done.step.dependOn(&copy_7zz.step);
+    done.step.dependOn(&copy_rsync.step);
     return &done.step;
 }
