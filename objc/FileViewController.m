@@ -151,6 +151,7 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
                                   NSCollectionViewDelegate,
                                   ContextMenuCollectionViewDelegate,
                                   CollectionViewDoubleClickDelegate,
+                                  NSBrowserDelegate,
                                   NSDraggingSource,
                                   NSTextFieldDelegate,
                                   NSMenuDelegate,
@@ -160,6 +161,9 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 @property (nonatomic, strong) ContextMenuTableView      *tableView;
 @property (nonatomic, strong) NSScrollView              *iconScrollView;  // icon view
 @property (nonatomic, strong) ContextMenuCollectionView *collectionView;
+@property (nonatomic, strong) NSBrowser                 *browser;         // column view
+@property (nonatomic, strong) NSMutableArray<NSMutableArray<FileEntry *> *> *columnEntries; // per-column data
+@property (nonatomic, strong) NSMutableArray<NSString *> *columnPaths;    // path for each column
 @property (nonatomic, strong) NSMutableArray<FileEntry *> *entries;
 @property (nonatomic, copy)   NSString                 *currentPath;   // also satisfies the readonly public decl
 @property (nonatomic, strong) NSArray<NSString *>      *clipboardPaths;
@@ -177,11 +181,13 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 - (instancetype)initWithPath:(NSString *)path {
     self = [super initWithNibName:nil bundle:nil];
     if (!self) return nil;
-    _entries     = [NSMutableArray array];
-    _clipboardOp = ClipboardOperationNone;
-    _renameRow   = -1;
-    _viewMode    = FileViewModeList;
-    _currentPath = [path copy];
+    _entries       = [NSMutableArray array];
+    _columnEntries = [NSMutableArray array];
+    _columnPaths   = [NSMutableArray array];
+    _clipboardOp   = ClipboardOperationNone;
+    _renameRow     = -1;
+    _viewMode      = FileViewModeList;
+    _currentPath   = [path copy];
     return self;
 }
 
@@ -263,6 +269,24 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
     _iconScrollView.hidden = YES;  // start with list view
     [self.view addSubview:_iconScrollView];
 
+    // Column view (NSBrowser)
+    _browser = [[NSBrowser alloc] initWithFrame:NSZeroRect];
+    _browser.allowsMultipleSelection = YES;
+    _browser.allowsEmptySelection    = YES;
+    _browser.hasHorizontalScroller   = YES;
+    _browser.separatesColumns        = YES;
+    _browser.titled                  = NO;
+    _browser.minColumnWidth          = 180;
+    _browser.maxVisibleColumns       = 10;
+    _browser.translatesAutoresizingMaskIntoConstraints = NO;
+    _browser.hidden = YES;
+    _browser.target = self;
+    _browser.action = @selector(browserSingleClick:);
+    _browser.doubleAction = @selector(browserDoubleAction:);
+    [_browser setCellClass:[NSBrowserCell class]];
+    _browser.delegate = self;
+    [self.view addSubview:_browser];
+
     [NSLayoutConstraint activateConstraints:@[
         [_scrollView.topAnchor     constraintEqualToAnchor:self.view.topAnchor],
         [_scrollView.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
@@ -273,6 +297,11 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
         [_iconScrollView.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
         [_iconScrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_iconScrollView.bottomAnchor  constraintEqualToAnchor:statusLabel.topAnchor constant:-2],
+
+        [_browser.topAnchor     constraintEqualToAnchor:self.view.topAnchor],
+        [_browser.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
+        [_browser.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_browser.bottomAnchor  constraintEqualToAnchor:statusLabel.topAnchor constant:-2],
 
         [statusLabel.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
         [statusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
@@ -288,20 +317,24 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 
 - (void)setViewMode:(FileViewMode)viewMode {
     _viewMode = viewMode;
+    _scrollView.hidden     = YES;
+    _iconScrollView.hidden = YES;
+    _browser.hidden        = YES;
     switch (viewMode) {
         case FileViewModeList:
             _scrollView.hidden = NO;
-            _iconScrollView.hidden = YES;
             break;
         case FileViewModeIcon:
-            _scrollView.hidden = YES;
             _iconScrollView.hidden = NO;
             [_collectionView reloadData];
             break;
+        case FileViewModeColumns:
+            _browser.hidden = NO;
+            [self loadBrowserFromPath:_currentPath];
+            break;
         default:
-            // Column/Gallery not yet implemented – fall back to list
+            // Gallery not yet implemented – fall back to list
             _scrollView.hidden = NO;
-            _iconScrollView.hidden = YES;
             break;
     }
 }
@@ -356,6 +389,8 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 - (void)reloadAllViews {
     [_tableView reloadData];
     [_collectionView reloadData];
+    if (_viewMode == FileViewModeColumns)
+        [self loadBrowserFromPath:_currentPath];
 }
 
 - (void)updateStatusBar {
@@ -588,6 +623,122 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark – NSBrowserDelegate (column view)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (void)loadBrowserFromPath:(NSString *)rootPath {
+    [_columnEntries removeAllObjects];
+    [_columnPaths removeAllObjects];
+
+    [_columnPaths addObject:rootPath];
+    [_columnEntries addObject:[self entriesForPath:rootPath]];
+
+    [_browser loadColumnZero];
+}
+
+- (NSMutableArray<FileEntry *> *)entriesForPath:(NSString *)path {
+    NSMutableArray<FileEntry *> *result = [NSMutableArray array];
+    ZigDirListing *listing = zig_list_directory(path.UTF8String);
+    if (listing) {
+        NSWorkspace *ws = [NSWorkspace sharedWorkspace];
+        for (uint64_t i = 0; i < listing->count; i++) {
+            ZigDirEntry e = listing->entries[i];
+            if (!s_showHidden && e.name[0] == '.') continue;
+            FileEntry *fe = [[FileEntry alloc] init];
+            fe.name      = @(e.name);
+            fe.path      = @(e.path);
+            fe.isDir     = (BOOL)e.is_dir;
+            fe.isSymlink = (BOOL)e.is_symlink;
+            fe.size      = e.size;
+            fe.mtime     = e.mtime;
+            fe.icon      = [ws iconForFile:fe.path];
+            fe.icon.size = NSMakeSize(16, 16);
+            [result addObject:fe];
+        }
+        zig_free_dir_listing(listing);
+    }
+    [result sortUsingComparator:^NSComparisonResult(FileEntry *a, FileEntry *b) {
+        if (a.isDir != b.isDir) return a.isDir ? NSOrderedAscending : NSOrderedDescending;
+        return [a.name localizedCaseInsensitiveCompare:b.name];
+    }];
+    return result;
+}
+
+// NSBrowser passive delegate: provide row count per column.
+// For column > 0, load (or reload) entries based on the selected row in column-1.
+- (NSInteger)browser:(NSBrowser *)browser numberOfRowsInColumn:(NSInteger)column {
+    if (column > 0) {
+        NSInteger prevCol = column - 1;
+        NSInteger selRow  = [browser selectedRowInColumn:prevCol];
+        if (selRow >= 0 && (NSUInteger)prevCol < _columnEntries.count) {
+            NSMutableArray<FileEntry *> *prevEntries = _columnEntries[(NSUInteger)prevCol];
+            if (selRow < (NSInteger)prevEntries.count) {
+                FileEntry *fe = prevEntries[(NSUInteger)selRow];
+                if (fe.isDir) {
+                    NSString *expectedPath = fe.path;
+                    // Check if we already have the correct data for this column
+                    BOOL needsReload = ((NSUInteger)column >= _columnPaths.count ||
+                                        ![_columnPaths[(NSUInteger)column] isEqualToString:expectedPath]);
+                    if (needsReload) {
+                        // Trim everything from this column onward
+                        NSUInteger keepCount = (NSUInteger)column;
+                        while (_columnEntries.count > keepCount) [_columnEntries removeLastObject];
+                        while (_columnPaths.count > keepCount)   [_columnPaths removeLastObject];
+                        [_columnEntries addObject:[self entriesForPath:expectedPath]];
+                        [_columnPaths addObject:expectedPath];
+                    }
+                }
+            }
+        }
+    }
+    if ((NSUInteger)column < _columnEntries.count)
+        return (NSInteger)_columnEntries[(NSUInteger)column].count;
+    return 0;
+}
+
+// NSBrowser passive delegate: configure each cell
+- (void)browser:(NSBrowser *)browser willDisplayCell:(NSBrowserCell *)cell
+          atRow:(NSInteger)row column:(NSInteger)column {
+    if ((NSUInteger)column >= _columnEntries.count) return;
+    NSMutableArray<FileEntry *> *entries = _columnEntries[(NSUInteger)column];
+    if (row >= (NSInteger)entries.count) return;
+    FileEntry *fe = entries[(NSUInteger)row];
+    cell.stringValue = fe.name;
+    cell.image       = fe.icon;
+    cell.leaf        = !fe.isDir;
+}
+
+// Single-click action — update currentPath and notify delegate
+- (void)browserSingleClick:(NSBrowser *)browser {
+    NSInteger col = browser.selectedColumn;
+    if (col < 0 || (NSUInteger)col >= _columnEntries.count) return;
+    NSInteger row = [browser selectedRowInColumn:col];
+    if (row < 0) return;
+
+    FileEntry *fe = _columnEntries[(NSUInteger)col][(NSUInteger)row];
+    if (fe.isDir) {
+        _currentPath = [fe.path copy];
+        [self.delegate fileViewController:self didNavigateToPath:fe.path];
+    } else {
+        _currentPath = [_columnPaths[(NSUInteger)col] copy];
+    }
+    [self updateStatusBar];
+}
+
+- (void)browserDoubleAction:(NSBrowser *)browser {
+    NSInteger col = browser.selectedColumn;
+    NSInteger row = [browser selectedRowInColumn:col];
+    if (col < 0 || row < 0) return;
+    if ((NSUInteger)col >= _columnEntries.count) return;
+    NSMutableArray<FileEntry *> *entries = _columnEntries[(NSUInteger)col];
+    if ((NSUInteger)row >= entries.count) return;
+    FileEntry *fe = entries[(NSUInteger)row];
+    if (!fe.isDir) {
+        [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:fe.path]];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark – Navigation
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -710,6 +861,16 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
             NSUInteger idx = ip.item;
             if (idx < _entries.count)
                 [paths addObject:_entries[idx].path];
+        }
+    } else if (_viewMode == FileViewModeColumns) {
+        NSInteger col = _browser.selectedColumn;
+        if (col >= 0 && (NSUInteger)col < _columnEntries.count) {
+            NSIndexSet *rows = [_browser selectedRowIndexesInColumn:col];
+            NSMutableArray<FileEntry *> *colEntries = _columnEntries[(NSUInteger)col];
+            [rows enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+                if (idx < colEntries.count)
+                    [paths addObject:colEntries[idx].path];
+            }];
         }
     } else {
         [_tableView.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {

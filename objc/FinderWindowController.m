@@ -195,7 +195,7 @@
                 [NSImage imageWithSystemSymbolName:@"square.grid.2x2"   accessibilityDescription:@"Iconos"],
                 [NSImage imageWithSystemSymbolName:@"list.bullet"       accessibilityDescription:@"Lista"],
                 [NSImage imageWithSystemSymbolName:@"rectangle.split.3x1" accessibilityDescription:@"Columnas"],
-                [NSImage imageWithSystemSymbolName:@"squares.below.rectangle" accessibilityDescription:@"Galería"],
+                // [NSImage imageWithSystemSymbolName:@"squares.below.rectangle" accessibilityDescription:@"Galería"],
             ]
             trackingMode:NSSegmentSwitchTrackingSelectOne
                   target:self
@@ -203,8 +203,8 @@
         _viewModeControl.selectedSegment = 1; // default = list
         [_viewModeControl setEnabled:YES forSegment:0]; // icon
         [_viewModeControl setEnabled:YES forSegment:1]; // list
-        [_viewModeControl setEnabled:NO  forSegment:2]; // columns (not yet)
-        [_viewModeControl setEnabled:NO  forSegment:3]; // gallery (not yet)
+        [_viewModeControl setEnabled:YES forSegment:2]; // columns
+        // [_viewModeControl setEnabled:NO  forSegment:3]; // gallery (not yet)
         item.view = _viewModeControl;
         return item;
     }
