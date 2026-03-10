@@ -129,6 +129,12 @@ fn makeBundleStep(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
         "R2 Finder.app/Contents/Resources/AppIcon.icns",
     );
 
+    // 3b) Copy r2_finder.png into Resources/
+    const copy_logo = b.addInstallFile(
+        b.path("r2_finder.png"),
+        "R2 Finder.app/Contents/Resources/r2_finder.png",
+    );
+
     // 4) Copy 7zz binary into Resources/
     const copy_7zz = b.addInstallFile(
         b.path("bin/7zz"),
@@ -148,5 +154,6 @@ fn makeBundleStep(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step {
     done.step.dependOn(&copy_icon.step);
     done.step.dependOn(&copy_7zz.step);
     done.step.dependOn(&copy_rsync.step);
+    done.step.dependOn(&copy_logo.step);
     return &done.step;
 }

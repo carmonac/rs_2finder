@@ -18,7 +18,6 @@
 @property (nonatomic, strong) NSSegmentedControl *navControl;   // back / forward segments
 @property (nonatomic, strong) NSSegmentedControl *viewModeControl;
 @property (nonatomic, strong) NSTextField        *pathLabel;
-
 @end
 
 @implementation FinderWindowController
@@ -29,8 +28,7 @@
     NSWindowStyleMask style = NSWindowStyleMaskTitled
                             | NSWindowStyleMaskClosable
                             | NSWindowStyleMaskMiniaturizable
-                            | NSWindowStyleMaskResizable
-                            | NSWindowStyleMaskFullSizeContentView;
+                            | NSWindowStyleMaskResizable;
 
     NSWindow *win = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
@@ -58,11 +56,11 @@
 // ───────────────────────────────────────────────
 
 - (void)setupToolbar {
-    NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"MainToolbar"];
+    NSToolbar *toolbar = [[NSToolbar alloc] initWithIdentifier:@"R2FinderToolbar"];
     toolbar.delegate = self;
     toolbar.allowsUserCustomization = NO;
     toolbar.displayMode           = NSToolbarDisplayModeIconOnly;
-    [self.window setToolbar:toolbar];
+    self.window.toolbar = toolbar;
     self.window.titlebarAppearsTransparent = NO;
 }
 
@@ -154,7 +152,7 @@
 // ───────────────────────────────────────────────
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar {
-    return @[@"BackForward", @"ViewMode", NSToolbarFlexibleSpaceItemIdentifier, @"PathLabel", NSToolbarFlexibleSpaceItemIdentifier, @"NewFolder", @"GoToFolder"];
+    return @[@"AppLogo", @"BackForward", @"ViewMode", NSToolbarFlexibleSpaceItemIdentifier, @"PathLabel", NSToolbarFlexibleSpaceItemIdentifier, @"NewFolder", @"GoToFolder"];
 }
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar {
@@ -168,6 +166,26 @@
 - (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
      itemForItemIdentifier:(NSToolbarItemIdentifier)itemIdentifier
  willBeInsertedIntoToolbar:(BOOL)flag {
+
+    if ([itemIdentifier isEqualToString:@"AppLogo"]) {
+        NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
+        static NSImage *s_logo = nil;
+        if (!s_logo) {
+            NSString *imgPath = [[NSBundle mainBundle] pathForResource:@"r2_finder" ofType:@"png"];
+            if (!imgPath) {
+                NSString *exePath = [[NSBundle mainBundle] executablePath];
+                imgPath = [[exePath stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"../../r2_finder.png"];
+            }
+            s_logo = [[NSImage alloc] initWithContentsOfFile:imgPath];
+            if (!s_logo) s_logo = [NSImage imageWithSystemSymbolName:@"doc.text.magnifyingglass" accessibilityDescription:@"R2 Finder"];
+        }
+        NSImage *copy = [s_logo copy];
+        copy.size = NSMakeSize(20, 20);
+        item.image = copy;
+        item.label = @"R2 Finder";
+        item.toolTip = @"R2 Finder";
+        return item;
+    }
 
     if ([itemIdentifier isEqualToString:@"BackForward"]) {
         NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
@@ -190,21 +208,16 @@
 
     if ([itemIdentifier isEqualToString:@"ViewMode"]) {
         NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
-        _viewModeControl = [NSSegmentedControl
-            segmentedControlWithImages:@[
-                [NSImage imageWithSystemSymbolName:@"square.grid.2x2"   accessibilityDescription:@"Iconos"],
-                [NSImage imageWithSystemSymbolName:@"list.bullet"       accessibilityDescription:@"Lista"],
-                [NSImage imageWithSystemSymbolName:@"rectangle.split.3x1" accessibilityDescription:@"Columnas"],
-                // [NSImage imageWithSystemSymbolName:@"squares.below.rectangle" accessibilityDescription:@"Galería"],
-            ]
-            trackingMode:NSSegmentSwitchTrackingSelectOne
-                  target:self
-                  action:@selector(viewModeAction:)];
-        _viewModeControl.selectedSegment = 1; // default = list
-        [_viewModeControl setEnabled:YES forSegment:0]; // icon
-        [_viewModeControl setEnabled:YES forSegment:1]; // list
-        [_viewModeControl setEnabled:YES forSegment:2]; // columns
-        // [_viewModeControl setEnabled:NO  forSegment:3]; // gallery (not yet)
+        _viewModeControl = [[NSSegmentedControl alloc] init];
+        _viewModeControl.segmentCount = 3;
+        _viewModeControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
+        [_viewModeControl setImage:[NSImage imageWithSystemSymbolName:@"square.grid.2x2"      accessibilityDescription:@"Iconos"]   forSegment:0];
+        [_viewModeControl setImage:[NSImage imageWithSystemSymbolName:@"list.bullet"           accessibilityDescription:@"Lista"]    forSegment:1];
+        [_viewModeControl setImage:[NSImage imageWithSystemSymbolName:@"rectangle.split.3x1"   accessibilityDescription:@"Columnas"] forSegment:2];
+        _viewModeControl.selectedSegment = 1;
+        _viewModeControl.target = self;
+        _viewModeControl.action = @selector(viewModeAction:);
+        [_viewModeControl sizeToFit];
         item.view = _viewModeControl;
         return item;
     }
