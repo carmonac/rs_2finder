@@ -16,6 +16,7 @@
 
 // Toolbar items
 @property (nonatomic, strong) NSSegmentedControl *navControl;   // back / forward segments
+@property (nonatomic, strong) NSSegmentedControl *viewModeControl;
 @property (nonatomic, strong) NSTextField        *pathLabel;
 
 @end
@@ -153,7 +154,7 @@
 // ───────────────────────────────────────────────
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:(NSToolbar *)toolbar {
-    return @[@"BackForward", NSToolbarFlexibleSpaceItemIdentifier, @"PathLabel", NSToolbarFlexibleSpaceItemIdentifier, @"NewFolder", @"GoToFolder"];
+    return @[@"BackForward", @"ViewMode", NSToolbarFlexibleSpaceItemIdentifier, @"PathLabel", NSToolbarFlexibleSpaceItemIdentifier, @"NewFolder", @"GoToFolder"];
 }
 
 - (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:(NSToolbar *)toolbar {
@@ -184,6 +185,27 @@
         [_navControl setEnabled:NO forSegment:0];
         [_navControl setEnabled:NO forSegment:1];
         item.view = _navControl;
+        return item;
+    }
+
+    if ([itemIdentifier isEqualToString:@"ViewMode"]) {
+        NSToolbarItem *item = [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
+        _viewModeControl = [NSSegmentedControl
+            segmentedControlWithImages:@[
+                [NSImage imageWithSystemSymbolName:@"square.grid.2x2"   accessibilityDescription:@"Iconos"],
+                [NSImage imageWithSystemSymbolName:@"list.bullet"       accessibilityDescription:@"Lista"],
+                [NSImage imageWithSystemSymbolName:@"rectangle.split.3x1" accessibilityDescription:@"Columnas"],
+                [NSImage imageWithSystemSymbolName:@"squares.below.rectangle" accessibilityDescription:@"Galería"],
+            ]
+            trackingMode:NSSegmentSwitchTrackingSelectOne
+                  target:self
+                  action:@selector(viewModeAction:)];
+        _viewModeControl.selectedSegment = 1; // default = list
+        [_viewModeControl setEnabled:YES forSegment:0]; // icon
+        [_viewModeControl setEnabled:YES forSegment:1]; // list
+        [_viewModeControl setEnabled:NO  forSegment:2]; // columns (not yet)
+        [_viewModeControl setEnabled:NO  forSegment:3]; // gallery (not yet)
+        item.view = _viewModeControl;
         return item;
     }
 
@@ -218,6 +240,10 @@
     }
 
     return nil;
+}
+
+- (IBAction)viewModeAction:(NSSegmentedControl *)seg {
+    _fileVC.viewMode = (FileViewMode)seg.selectedSegment;
 }
 
 - (IBAction)backForwardAction:(NSSegmentedControl *)seg {

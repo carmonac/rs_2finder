@@ -42,6 +42,94 @@
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
+// IconCollectionViewItem – NSCollectionViewItem for icon grid view
+// ─────────────────────────────────────────────────────────────────────────────
+
+@interface IconCollectionViewItem : NSCollectionViewItem
+@end
+
+@implementation IconCollectionViewItem
+
+- (void)loadView {
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 90, 90)];
+
+    NSImageView *iv = [[NSImageView alloc] initWithFrame:NSZeroRect];
+    iv.translatesAutoresizingMaskIntoConstraints = NO;
+    iv.imageScaling = NSImageScaleProportionallyDown;
+    iv.imageAlignment = NSImageAlignCenter;
+    [container addSubview:iv];
+
+    NSTextField *tf = [NSTextField labelWithString:@""];
+    tf.translatesAutoresizingMaskIntoConstraints = NO;
+    tf.alignment = NSTextAlignmentCenter;
+    tf.lineBreakMode = NSLineBreakByTruncatingTail;
+    tf.maximumNumberOfLines = 2;
+    tf.font = [NSFont systemFontOfSize:11];
+    [container addSubview:tf];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [iv.topAnchor      constraintEqualToAnchor:container.topAnchor constant:4],
+        [iv.centerXAnchor  constraintEqualToAnchor:container.centerXAnchor],
+        [iv.widthAnchor    constraintEqualToConstant:64],
+        [iv.heightAnchor   constraintEqualToConstant:64],
+        [tf.topAnchor      constraintEqualToAnchor:iv.bottomAnchor constant:2],
+        [tf.leadingAnchor  constraintEqualToAnchor:container.leadingAnchor constant:2],
+        [tf.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-2],
+    ]];
+
+    self.view = container;
+    self.imageView = iv;
+    self.textField = tf;
+}
+
+- (void)setSelected:(BOOL)selected {
+    [super setSelected:selected];
+    self.view.layer.backgroundColor = selected
+        ? [NSColor selectedContentBackgroundColor].CGColor
+        : [NSColor clearColor].CGColor;
+    self.view.layer.cornerRadius = 6;
+}
+
+@end
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ContextMenuCollectionView – NSCollectionView with right-click menu support
+// ─────────────────────────────────────────────────────────────────────────────
+
+@protocol ContextMenuCollectionViewDelegate <NSCollectionViewDelegate>
+@optional
+- (NSMenu *)contextMenuForCollectionView:(NSCollectionView *)cv atPoint:(NSPoint)point;
+@end
+
+@protocol CollectionViewDoubleClickDelegate <NSObject>
+@optional
+- (void)collectionViewDidDoubleClick:(NSCollectionView *)cv atIndexPath:(NSIndexPath *)ip;
+@end
+
+@interface ContextMenuCollectionView : NSCollectionView @end
+@implementation ContextMenuCollectionView
+- (NSMenu *)menuForEvent:(NSEvent *)event {
+    NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
+    id<ContextMenuCollectionViewDelegate> d = (id<ContextMenuCollectionViewDelegate>)self.delegate;
+    if ([d respondsToSelector:@selector(contextMenuForCollectionView:atPoint:)])
+        return [d contextMenuForCollectionView:self atPoint:loc];
+    return [super menuForEvent:event];
+}
+- (void)mouseDown:(NSEvent *)event {
+    [super mouseDown:event];
+    if (event.clickCount == 2) {
+        NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
+        NSIndexPath *ip = [self indexPathForItemAtPoint:loc];
+        if (ip) {
+            id<CollectionViewDoubleClickDelegate> d = (id<CollectionViewDoubleClickDelegate>)self.delegate;
+            if ([d respondsToSelector:@selector(collectionViewDidDoubleClick:atIndexPath:)])
+                [d collectionViewDidDoubleClick:self atIndexPath:ip];
+        }
+    }
+}
+@end
+
+// ─────────────────────────────────────────────────────────────────────────────
 // File-scope state
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -59,13 +147,19 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 
 @interface FileViewController () <NSTableViewDataSource,
                                   ContextMenuTableViewDelegate,
+                                  NSCollectionViewDataSource,
+                                  NSCollectionViewDelegate,
+                                  ContextMenuCollectionViewDelegate,
+                                  CollectionViewDoubleClickDelegate,
                                   NSDraggingSource,
                                   NSTextFieldDelegate,
                                   NSMenuDelegate,
                                   QLPreviewPanelDataSource,
                                   QLPreviewPanelDelegate>
-@property (nonatomic, strong) NSScrollView              *scrollView;
+@property (nonatomic, strong) NSScrollView              *scrollView;      // list view
 @property (nonatomic, strong) ContextMenuTableView      *tableView;
+@property (nonatomic, strong) NSScrollView              *iconScrollView;  // icon view
+@property (nonatomic, strong) ContextMenuCollectionView *collectionView;
 @property (nonatomic, strong) NSMutableArray<FileEntry *> *entries;
 @property (nonatomic, copy)   NSString                 *currentPath;   // also satisfies the readonly public decl
 @property (nonatomic, strong) NSArray<NSString *>      *clipboardPaths;
@@ -86,6 +180,7 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
     _entries     = [NSMutableArray array];
     _clipboardOp = ClipboardOperationNone;
     _renameRow   = -1;
+    _viewMode    = FileViewModeList;
     _currentPath = [path copy];
     return self;
 }
@@ -140,11 +235,45 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:_scrollView];
 
+    // Icon view (NSCollectionView)
+    NSCollectionViewFlowLayout *flow = [[NSCollectionViewFlowLayout alloc] init];
+    flow.itemSize                = NSMakeSize(90, 90);
+    flow.minimumInteritemSpacing = 10;
+    flow.minimumLineSpacing      = 10;
+    flow.sectionInset            = NSEdgeInsetsMake(10, 10, 10, 10);
+
+    _collectionView = [[ContextMenuCollectionView alloc] initWithFrame:NSZeroRect];
+    _collectionView.collectionViewLayout = flow;
+    _collectionView.dataSource           = self;
+    _collectionView.delegate             = self;
+    _collectionView.selectable           = YES;
+    _collectionView.allowsMultipleSelection = YES;
+    _collectionView.backgroundColors     = @[[NSColor controlBackgroundColor]];
+    [_collectionView registerClass:[IconCollectionViewItem class]
+             forItemWithIdentifier:@"IconItem"];
+    [_collectionView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
+    [_collectionView setDraggingSourceOperationMask:NSDragOperationCopy | NSDragOperationMove
+                                           forLocal:NO];
+
+    _iconScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    _iconScrollView.hasVerticalScroller   = YES;
+    _iconScrollView.hasHorizontalScroller = NO;
+    _iconScrollView.documentView          = _collectionView;
+    _iconScrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    _iconScrollView.hidden = YES;  // start with list view
+    [self.view addSubview:_iconScrollView];
+
     [NSLayoutConstraint activateConstraints:@[
         [_scrollView.topAnchor     constraintEqualToAnchor:self.view.topAnchor],
         [_scrollView.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
         [_scrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [_scrollView.bottomAnchor  constraintEqualToAnchor:statusLabel.topAnchor constant:-2],
+
+        [_iconScrollView.topAnchor     constraintEqualToAnchor:self.view.topAnchor],
+        [_iconScrollView.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
+        [_iconScrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_iconScrollView.bottomAnchor  constraintEqualToAnchor:statusLabel.topAnchor constant:-2],
+
         [statusLabel.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
         [statusLabel.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [statusLabel.bottomAnchor   constraintEqualToAnchor:self.view.bottomAnchor constant:-4],
@@ -155,6 +284,26 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     if (_currentPath) [self loadPath:_currentPath];
+}
+
+- (void)setViewMode:(FileViewMode)viewMode {
+    _viewMode = viewMode;
+    switch (viewMode) {
+        case FileViewModeList:
+            _scrollView.hidden = NO;
+            _iconScrollView.hidden = YES;
+            break;
+        case FileViewModeIcon:
+            _scrollView.hidden = YES;
+            _iconScrollView.hidden = NO;
+            [_collectionView reloadData];
+            break;
+        default:
+            // Column/Gallery not yet implemented – fall back to list
+            _scrollView.hidden = NO;
+            _iconScrollView.hidden = YES;
+            break;
+    }
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -200,8 +349,13 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
         }
         zig_free_dir_listing(listing);
     }
-    [_tableView reloadData];
+    [self reloadAllViews];
     [self updateStatusBar];
+}
+
+- (void)reloadAllViews {
+    [_tableView reloadData];
+    [_collectionView reloadData];
 }
 
 - (void)updateStatusBar {
@@ -332,13 +486,124 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark – NSCollectionViewDataSource
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (NSInteger)collectionView:(NSCollectionView *)cv numberOfItemsInSection:(NSInteger)section {
+    return (NSInteger)_entries.count;
+}
+
+- (NSCollectionViewItem *)collectionView:(NSCollectionView *)cv
+     itemForRepresentedObjectAtIndexPath:(NSIndexPath *)indexPath {
+    IconCollectionViewItem *item = [cv makeItemWithIdentifier:@"IconItem" forIndexPath:indexPath];
+    NSUInteger idx = indexPath.item;
+    if (idx < _entries.count) {
+        FileEntry *entry = _entries[idx];
+        item.textField.stringValue = entry.name;
+        // Use a larger icon for icon view
+        NSImage *icon = [entry.icon copy];
+        icon.size = NSMakeSize(64, 64);
+        item.imageView.image = icon;
+        item.view.alphaValue = (_clipboardOp == ClipboardOperationCut &&
+                                [_clipboardPaths containsObject:entry.path]) ? 0.35 : 1.0;
+    }
+    return item;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark – NSCollectionViewDelegate (double-click & context menu)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (void)collectionView:(NSCollectionView *)cv didSelectItemsAtIndexPaths:(NSSet<NSIndexPath *> *)indexPaths {
+    if ([QLPreviewPanel sharedPreviewPanelExists] && [QLPreviewPanel sharedPreviewPanel].isVisible)
+        [[QLPreviewPanel sharedPreviewPanel] reloadData];
+}
+
+- (void)collectionView:(NSCollectionView *)cv didDeselectItemsAtIndexPaths:(NSSet<NSIndexPath *> *)indexPaths {
+    if ([QLPreviewPanel sharedPreviewPanelExists] && [QLPreviewPanel sharedPreviewPanel].isVisible)
+        [[QLPreviewPanel sharedPreviewPanel] reloadData];
+}
+
+- (NSMenu *)contextMenuForCollectionView:(NSCollectionView *)cv atPoint:(NSPoint)point {
+    NSIndexPath *ip = [cv indexPathForItemAtPoint:point];
+    if (ip) {
+        NSSet *sel = cv.selectionIndexPaths;
+        if (![sel containsObject:ip]) {
+            cv.selectionIndexPaths = [NSSet setWithObject:ip];
+        }
+        return [self contextMenuForTableView:_tableView clickedRow:(NSInteger)ip.item];
+    }
+    return [self contextMenuForTableView:_tableView clickedRow:-1];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark – NSCollectionViewDelegate (drag source)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (BOOL)collectionView:(NSCollectionView *)cv
+    canDragItemsAtIndexPaths:(NSSet<NSIndexPath *> *)indexPaths
+               withEvent:(NSEvent *)event {
+    return YES;
+}
+
+- (id<NSPasteboardWriting>)collectionView:(NSCollectionView *)cv
+              pasteboardWriterForItemAtIndexPath:(NSIndexPath *)indexPath {
+    NSUInteger idx = indexPath.item;
+    if (idx < _entries.count)
+        return [NSURL fileURLWithPath:_entries[idx].path];
+    return nil;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark – NSCollectionViewDelegate (drag destination)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (NSDragOperation)collectionView:(NSCollectionView *)cv
+                     validateDrop:(id<NSDraggingInfo>)info
+                proposedIndexPath:(NSIndexPath *__nonnull *__nonnull)proposedIndexPath
+                    dropOperation:(NSCollectionViewDropOperation *)proposedDropOperation {
+    NSDragOperation mask = info.draggingSourceOperationMask;
+    if (mask & NSDragOperationMove) return NSDragOperationMove;
+    return NSDragOperationCopy;
+}
+
+- (BOOL)collectionView:(NSCollectionView *)cv
+            acceptDrop:(id<NSDraggingInfo>)info
+             indexPath:(NSIndexPath *)indexPath
+         dropOperation:(NSCollectionViewDropOperation)dropOperation {
+    NSArray<NSURL *> *urls = [info.draggingPasteboard
+        readObjectsForClasses:@[[NSURL class]]
+        options:@{ NSPasteboardURLReadingFileURLsOnlyKey: @YES }];
+    if (!urls.count) return NO;
+    NSString *dstDir = _currentPath;
+    if (dropOperation == NSCollectionViewDropOn && indexPath.item < _entries.count) {
+        FileEntry *target = _entries[indexPath.item];
+        if (target.isDir) dstDir = target.path;
+    }
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSURL *u in urls) [paths addObject:u.path];
+    BOOL isMove = (info.draggingSourceOperationMask & NSDragOperationMove) != 0;
+    [self performTransferFromPaths:paths toDir:dstDir isMove:isMove];
+    return YES;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark – Navigation
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (IBAction)tableViewDoubleClicked:(id)sender {
     NSInteger row = _tableView.clickedRow;
     if (row < 0) return;
-    FileEntry *e = _entries[(NSUInteger)row];
+    [self openEntryAtIndex:(NSUInteger)row];
+}
+
+- (void)collectionViewDidDoubleClick:(NSCollectionView *)cv atIndexPath:(NSIndexPath *)ip {
+    [self openEntryAtIndex:ip.item];
+}
+
+- (void)openEntryAtIndex:(NSUInteger)idx {
+    if (idx >= _entries.count) return;
+    FileEntry *e = _entries[idx];
     if (e.isDir) {
         [self loadPath:e.path];
         [self.delegate fileViewController:self didNavigateToPath:e.path];
@@ -440,35 +705,48 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
 
 - (NSArray<NSString *> *)selectedPaths {
     NSMutableArray *paths = [NSMutableArray array];
-    [_tableView.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
-        [paths addObject:self.entries[idx].path];
-    }];
+    if (_viewMode == FileViewModeIcon) {
+        for (NSIndexPath *ip in _collectionView.selectionIndexPaths) {
+            NSUInteger idx = ip.item;
+            if (idx < _entries.count)
+                [paths addObject:_entries[idx].path];
+        }
+    } else {
+        [_tableView.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+            [paths addObject:self.entries[idx].path];
+        }];
+    }
     return paths;
 }
 
 - (IBAction)openSelected:(id)sender {
-    [_tableView.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
-        FileEntry *e = self.entries[idx];
+    NSArray<NSString *> *paths = [self selectedPaths];
+    for (NSString *path in paths) {
+        NSUInteger idx = [_entries indexOfObjectPassingTest:^BOOL(FileEntry *e, NSUInteger i, BOOL *stop) {
+            return [e.path isEqualToString:path];
+        }];
+        if (idx == NSNotFound) continue;
+        FileEntry *e = _entries[idx];
         if (e.isDir) {
             [self loadPath:e.path];
             [self.delegate fileViewController:self didNavigateToPath:e.path];
-            *stop = YES;
+            return;
         } else {
             [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:e.path]];
         }
-    }];
+    }
 }
 
 - (IBAction)copySelected:(id)sender {
     _clipboardPaths = [self selectedPaths];
     _clipboardOp    = ClipboardOperationCopy;
-    [_tableView reloadData];
+    [self reloadAllViews];
 }
 
 - (IBAction)cutSelected:(id)sender {
     _clipboardPaths = [self selectedPaths];
     _clipboardOp    = ClipboardOperationCut;
-    [_tableView reloadData];
+    [self reloadAllViews];
 }
 
 - (IBAction)pasteHere:(id)sender {
@@ -479,7 +757,7 @@ typedef NS_ENUM(NSInteger, ClipboardOperation) {
     if (isMove) {
         _clipboardPaths = nil;
         _clipboardOp    = ClipboardOperationNone;
-        [_tableView reloadData];
+        [self reloadAllViews];
     }
 }
 
@@ -712,7 +990,7 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
     [self performTransferFromPaths:paths toDir:_currentPath isMove:YES];
     _clipboardPaths = nil;
     _clipboardOp    = ClipboardOperationNone;
-    [_tableView reloadData];
+    [self reloadAllViews];
 }
 
 - (IBAction)compressSelected:(id)sender {
@@ -1002,17 +1280,15 @@ static void doneCb(void *ctx, bool success, const char *errMsg) {
 
 // QLPreviewPanelDataSource
 - (NSInteger)numberOfPreviewItemsInPreviewPanel:(QLPreviewPanel *)panel {
-    return (NSInteger)_tableView.selectedRowIndexes.count;
+    NSArray *sel = [self selectedPaths];
+    return (NSInteger)sel.count;
 }
 
 - (id<QLPreviewItem>)previewPanel:(QLPreviewPanel *)panel previewItemAtIndex:(NSInteger)index {
-    __block NSInteger current = 0;
-    __block NSString *path = nil;
-    [_tableView.selectedRowIndexes enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
-        if (current == index) { path = self.entries[idx].path; *stop = YES; }
-        current++;
-    }];
-    return path ? [NSURL fileURLWithPath:path] : nil;
+    NSArray *sel = [self selectedPaths];
+    if (index < (NSInteger)sel.count)
+        return [NSURL fileURLWithPath:sel[(NSUInteger)index]];
+    return nil;
 }
 
 // QLPreviewPanelDelegate – keep the panel in sync when the table selection changes.
